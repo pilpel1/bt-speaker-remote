@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="רמקול" />
+  <meta name="theme-color" content="#f2f2f7" />
+  <title>רמקול בלוטות׳</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="/static/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
+</head>
+<body>
+  <div id="app">
+    <header class="nav">
+      <div class="nav-large">
+        <p class="eyebrow" id="hostLabel">שרת האודיו</p>
+        <h1>נגן</h1>
+      </div>
+    </header>
+
+    <main>
+      <!-- Bluetooth — compact accordion -->
+      <section class="group bt-accordion" id="btAccordion">
+        <button type="button" class="cell bt-summary" id="btToggleRow" aria-expanded="false">
+          <div class="cell-icon blue">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29M13 5.83l1.88 1.88L13 9.59M14.88 16.29L13 18.17v-3.76l1.88 1.88Z"/></svg>
+          </div>
+          <div class="cell-body">
+            <div class="cell-title">בלוטות׳</div>
+            <div class="cell-sub" id="btSubtitle">כבוי</div>
+          </div>
+          <label class="ios-switch" dir="ltr" onclick="event.stopPropagation()">
+            <input type="checkbox" id="btPower" />
+            <span class="track"></span>
+          </label>
+          <span class="bt-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="bt-panel" id="btPanel" hidden>
+          <p class="footer-note bt-panel-note">הפעל כדי לגלות ולחבר רמקולים ליד המחשב.</p>
+
+          <p class="section-label" id="myDevicesLabel">המכשירים שלי</p>
+          <div class="group nested" id="connectedGroup">
+            <div class="cell empty" id="connectedEmpty">
+              <div class="cell-body">
+                <div class="cell-title muted">אין רמקול מחובר</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-row">
+            <p class="section-label">רמקולים בקרבת מקום</p>
+            <button type="button" class="text-btn" id="scanBtn">סריקה</button>
+          </div>
+          <div class="group nested" id="devicesGroup">
+            <div class="cell empty" id="devicesEmpty">
+              <div class="cell-body">
+                <div class="cell-title muted">לחץ סריקה כדי למצוא רמקולים</div>
+              </div>
+            </div>
+          </div>
+          <p class="footer-note bt-panel-note">שים את הרמקול במצב זיווג אם הוא לא מופיע.</p>
+        </div>
+      </section>
+
+      <!-- Dominant player -->
+      <section class="player-card group" id="playerCard">
+        <div class="player-art" aria-hidden="true">
+          <svg class="player-art-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+        </div>
+        <div class="player-meta">
+          <div class="now-title" id="nowTitle">כלום לא מתנגן</div>
+          <div class="now-sub" id="nowSub" hidden></div>
+          <div class="playlist-info" id="playlistInfo" hidden></div>
+        </div>
+
+        <div class="seek-row">
+          <span class="time-label" id="timeCurrent">0:00</span>
+          <input type="range" id="seekBar" class="seek-bar" min="0" max="1000" value="0" step="1" disabled />
+          <span class="time-label" id="timeDuration">0:00</span>
+        </div>
+
+        <div class="transport" dir="ltr">
+          <button type="button" class="icon-btn" id="prevBtn" aria-label="הקודם" title="הקודם">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 6h2v12H6V6zm3.5 6 8.5 6V6l-8.5 6z"/></svg>
+          </button>
+          <button type="button" class="icon-btn primary" id="playPauseBtn" aria-label="נגן" title="נגן">
+            <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7L8 5z"/></svg>
+            <svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true" hidden><path fill="currentColor" d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="stopBtn" aria-label="עצור" title="עצור">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 6h12v12H6V6z"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="nextBtn" aria-label="הבא" title="הבא">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16 6h2v12h-2V6zM6 18l8.5-6L6 6v12z"/></svg>
+          </button>
+        </div>
+
+        <div class="cell volume-cell">
+          <span class="vol-icon" aria-hidden="true">🔈</span>
+          <input type="range" id="volSlider" min="0" max="100" value="70" />
+          <span class="vol-icon" aria-hidden="true">🔊</span>
+          <span class="vol-val" id="volVal">70%</span>
+        </div>
+
+        <p class="no-speaker-msg" id="noSpeakerMsg" hidden>אין רמקול בלוטות׳ מחובר — חבר רמקול כדי לנגן.</p>
+
+        <div class="cell">
+          <input
+            id="ytUrl"
+            class="ios-input"
+            type="url"
+            inputmode="url"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="קישור יוטיוב / פלייליסט / מיקס…"
+            value=""
+          />
+        </div>
+        <div class="cell actions">
+          <button type="button" class="pill primary" id="playBtn">נגן קישור</button>
+        </div>
+
+        <div class="cell search-cell">
+          <input
+            id="ytSearch"
+            class="ios-input"
+            type="search"
+            autocomplete="off"
+            placeholder="חיפוש ביוטיוב…"
+          />
+          <button type="button" class="pill" id="searchBtn">חיפוש</button>
+        </div>
+        <div class="search-results" id="searchResults" hidden></div>
+      </section>
+      <p class="footer-note">השמעה במחשב ונשלחת לרמקול הבלוטות׳ המחובר.</p>
+
+      <!-- Access admin (only visible to admin devices) -->
+      <div id="adminSection" hidden>
+        <p class="section-label">גישה</p>
+        <section class="group">
+          <div class="cell column">
+            <div class="cell-title">הזמנת מכשיר</div>
+            <div class="cell-sub">תן שם (למשל טלפון של…). הקישור חד־פעמי, 24 שעות.</div>
+          </div>
+          <div class="cell">
+            <input
+              id="inviteName"
+              class="ios-input"
+              type="text"
+              autocomplete="off"
+              placeholder="שם המכשיר"
+            />
+          </div>
+          <div class="cell actions">
+            <button type="button" class="pill primary" id="createInviteBtn">צור הזמנה</button>
+            <button type="button" class="pill" id="refreshAccessBtn">רענון</button>
+          </div>
+          <div class="cell column" id="lastInviteBox" hidden>
+            <div class="cell-title">קישור הזמנה חדש</div>
+            <div class="invite-url" id="lastInviteUrl"></div>
+            <div class="cell actions" style="padding-inline:0">
+              <button type="button" class="pill" id="copyInviteBtn">העתק קישור</button>
+            </div>
+          </div>
+        </section>
+        <p class="footer-note" id="authWhoami">מחובר כ־…</p>
+
+        <p class="section-label">הזמנות פתוחות</p>
+        <section class="group" id="adminInvitesGroup">
+          <div class="cell empty">
+            <div class="cell-body">
+              <div class="cell-title muted">אין הזמנות פתוחות</div>
+            </div>
+          </div>
+        </section>
+
+        <p class="section-label">דפדפנים מורשים</p>
+        <section class="group" id="adminDevicesGroup">
+          <div class="cell empty">
+            <div class="cell-body">
+              <div class="cell-title muted">אין</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <p class="section-label">סטטוס</p>
+      <section class="group">
+        <div class="cell">
+          <div class="cell-body">
+            <div class="cell-title">פעולה אחרונה</div>
+            <div class="cell-sub" id="statusLine">מוכן</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+    <div id="busy" class="busy" hidden>
+      <div class="spinner"></div>
+      <p id="busyText">עובד…</p>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

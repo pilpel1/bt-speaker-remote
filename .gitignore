@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime / secrets (never commit)
+.env
+.env.*
+!.env.example
+authorized_devices.json
+authorized_devices.json.tmp
+logs/
+*.log
+*.pid
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

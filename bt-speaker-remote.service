@@ -1,0 +1,16 @@
+[Unit]
+Description=BT Speaker Remote (Bluetooth + YouTube control panel)
+After=network.target bluetooth.service sound.target default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bt-speaker-remote
+EnvironmentFile=-%h/bt-speaker-remote/.env
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart=%h/bt-speaker-remote/.venv/bin/python %h/bt-speaker-remote/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
