@@ -13,9 +13,21 @@ __pycache__/
 !.env.example
 authorized_devices.json
 authorized_devices.json.tmp
+playlists.json
+playlists.json.tmp
+history.json
+history.json.tmp
 logs/
 *.log
 *.pid
+
+# Media library (keep folder placeholders)
+media/uploads/*
+!media/uploads/.gitkeep
+media/recordings/*
+!media/recordings/.gitkeep
+media/saved/*
+!media/saved/.gitkeep
 
 # OS / editor
 .DS_Store
@@ -23,3 +35,6 @@ logs/
 .vscode/
 *.swp
 *~
+
+# dev environment
+*.plan.md

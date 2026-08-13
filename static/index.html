@@ -108,37 +108,126 @@
         </div>
 
         <p class="no-speaker-msg" id="noSpeakerMsg" hidden>אין רמקול בלוטות׳ מחובר — חבר רמקול כדי לנגן.</p>
-
-        <div class="cell">
-          <input
-            id="ytUrl"
-            class="ios-input"
-            type="url"
-            inputmode="url"
-            autocomplete="off"
-            autocapitalize="off"
-            spellcheck="false"
-            placeholder="קישור יוטיוב / פלייליסט / מיקס…"
-            value=""
-          />
-        </div>
-        <div class="cell actions">
-          <button type="button" class="pill primary" id="playBtn">נגן קישור</button>
-        </div>
-
-        <div class="cell search-cell">
-          <input
-            id="ytSearch"
-            class="ios-input"
-            type="search"
-            autocomplete="off"
-            placeholder="חיפוש ביוטיוב…"
-          />
-          <button type="button" class="pill" id="searchBtn">חיפוש</button>
-        </div>
-        <div class="search-results" id="searchResults" hidden></div>
       </section>
       <p class="footer-note">השמעה במחשב ונשלחת לרמקול הבלוטות׳ המחובר.</p>
+
+      <div class="seg" role="tablist" id="sourceTabs">
+        <button type="button" class="seg-btn is-active" data-tab="youtube" role="tab" aria-selected="true">יוטיוב</button>
+        <button type="button" class="seg-btn" data-tab="library" role="tab" aria-selected="false">ספרייה</button>
+        <button type="button" class="seg-btn" data-tab="record" role="tab" aria-selected="false">הקלטה</button>
+        <button type="button" class="seg-btn" data-tab="history" role="tab" aria-selected="false">אחרונים</button>
+      </div>
+
+      <div id="tab-youtube" class="tab-pane" data-tab="youtube">
+        <section class="group">
+          <div class="cell">
+            <input
+              id="ytUrl"
+              class="ios-input"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="קישור יוטיוב / פלייליסט / מיקס…"
+              value=""
+            />
+          </div>
+          <div class="cell actions">
+            <button type="button" class="pill primary" id="playBtn">נגן קישור</button>
+            <button type="button" class="pill" id="saveUrlBtn">שמור לספרייה</button>
+          </div>
+          <div class="cell search-cell">
+            <input
+              id="ytSearch"
+              class="ios-input"
+              type="search"
+              autocomplete="off"
+              placeholder="חיפוש ביוטיוב…"
+            />
+            <button type="button" class="pill" id="searchBtn">חיפוש</button>
+          </div>
+          <div class="search-results" id="searchResults" hidden></div>
+        </section>
+      </div>
+
+      <div id="tab-library" class="tab-pane" data-tab="library" hidden>
+        <div class="section-row">
+          <p class="section-label">קבצים</p>
+          <button type="button" class="text-btn" id="uploadBtn">העלה</button>
+        </div>
+        <input type="file" id="uploadFile" accept="audio/*,.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,.webm,.mp4" hidden multiple />
+        <section class="group" id="libraryGroup">
+          <div class="cell empty">
+            <div class="cell-body">
+              <div class="cell-title muted">אין קבצים עדיין</div>
+              <div class="cell-sub">העלה מהטלפון או זרוק קבצים לתיקיית media במחשב</div>
+            </div>
+          </div>
+        </section>
+
+        <div class="section-row">
+          <p class="section-label">פלייליסטים</p>
+        </div>
+        <section class="group">
+          <div class="cell">
+            <input id="playlistName" class="ios-input" type="text" autocomplete="off" placeholder="שם פלייליסט חדש" />
+          </div>
+          <div class="cell actions">
+            <button type="button" class="pill primary" id="createPlaylistBtn">צור פלייליסט</button>
+          </div>
+        </section>
+        <section class="group" id="playlistsGroup">
+          <div class="cell empty">
+            <div class="cell-body">
+              <div class="cell-title muted">אין פלייליסטים</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div id="tab-record" class="tab-pane" data-tab="record" hidden>
+        <section class="group">
+          <div class="cell column record-cell">
+            <button type="button" class="rec-btn" id="recBtn" aria-label="הקלט">
+              <span class="rec-dot"></span>
+            </button>
+            <div class="rec-timer" id="recTimer">0:00</div>
+            <p class="rec-hint" id="recHint">לחץ כדי להקליט הודעה מהטלפון ולשלוח לרמקול בבית.</p>
+            <div class="cell actions rec-actions" id="recActions" hidden>
+              <button type="button" class="pill primary" id="recSendBtn">שלח לרמקול</button>
+              <button type="button" class="pill" id="recSaveBtn">שמור בלי לנגן</button>
+              <button type="button" class="pill danger" id="recDiscardBtn">בטל</button>
+            </div>
+          </div>
+          <div class="cell actions">
+            <button type="button" class="pill" id="recUploadBtn">העלה קובץ קולי</button>
+          </div>
+        </section>
+        <input type="file" id="recFile" accept="audio/*,.m4a,.mp3,.wav,.webm,.aac,.ogg" hidden />
+        <p class="footer-note" id="recSecureNote" hidden>הקלטה מהמיקרופון דורשת HTTPS. אפשר תמיד להעלות קובץ מ-Voice Memos.</p>
+      </div>
+
+      <div id="tab-history" class="tab-pane" data-tab="history" hidden>
+        <section class="group" id="historyGroup">
+          <div class="cell empty">
+            <div class="cell-body">
+              <div class="cell-title muted">אין האזנות אחרונות</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div id="plPicker" class="pl-picker" hidden>
+        <div class="pl-picker-card">
+          <div class="cell-title">הוסף לפלייליסט</div>
+          <div id="plPickerList"></div>
+          <div class="cell actions" style="padding-inline:0">
+            <button type="button" class="pill" id="plPickerCancel">בטל</button>
+          </div>
+        </div>
+      </div>
+
 
       <!-- Access admin (only visible to admin devices) -->
       <div id="adminSection" hidden>

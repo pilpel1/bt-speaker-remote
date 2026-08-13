@@ -278,25 +278,63 @@ def stop() -> dict[str, Any]:
     return _with_status(True)
 
 
-def play(url: str) -> dict[str, Any]:
+def _is_http_url(src: str) -> bool:
+    s = (src or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://") or s.startswith("ytdl://")
+
+
+def _local_title(path: str) -> str:
+    return Path(path).stem.replace("_", " ").strip() or Path(path).name
+
+
+def _normalize_sources(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for raw in items:
+        src = (raw or "").strip()
+        if not src:
+            continue
+        if _is_http_url(src):
+            out.append(src)
+            continue
+        p = Path(src).expanduser()
+        if p.is_file():
+            out.append(str(p.resolve()))
+    return out
+
+
+def play(url: str, title: str | None = None) -> dict[str, Any]:
     url = (url or "").strip()
     if not url:
         return {"ok": False, "error": "Missing URL"}
+    return play_list([url], title=title)
+
+
+def play_list(items: list[str], title: str | None = None) -> dict[str, Any]:
+    sources = _normalize_sources(items)
+    if not sources:
+        return {"ok": False, "error": "Missing sources"}
 
     sink = ensure_bt_sink_default()
+    first = sources[0]
+    display = (title or "").strip()
+    if not display:
+        if _is_http_url(first):
+            display = resolve_title(first) or first
+        else:
+            display = _local_title(first)
+        if len(sources) > 1 and not _is_http_url(first):
+            display = f"{display} · {len(sources)} רצועות"
 
-    title = resolve_title(url) or url
     stop()
     _cleanup_ipc()
 
-    # Ensure runtime dir exists for the IPC socket
     try:
         IPC_PATH.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
 
     env = os.environ.copy()
-    # Do NOT pass --no-playlist — allow YouTube playlists/mixes
+    # Do NOT pass --no-playlist — allow YouTube playlists/mixes and local queues
     cmd = [
         "mpv",
         "--no-video",
@@ -304,9 +342,9 @@ def play(url: str) -> dict[str, Any]:
         "--no-terminal",
         "--force-window=no",
         f"--input-ipc-server={IPC_PATH}",
-        f"--title=bt-speaker-remote:{title[:80]}",
+        f"--title=bt-speaker-remote:{display[:80]}",
         "--ytdl-format=bestaudio/best",
-        url,
+        *sources,
     ]
     try:
         proc = subprocess.Popen(
@@ -326,17 +364,16 @@ def play(url: str) -> dict[str, Any]:
             {
                 "playing": True,
                 "paused": False,
-                "url": url,
-                "title": title,
+                "url": first if len(sources) == 1 else first,
+                "title": display,
                 "started_at": time.time(),
                 "error": None,
                 "sink": sink,
             }
         )
 
-    threading.Thread(target=_watch_proc, args=(proc, url), daemon=True).start()
+    threading.Thread(target=_watch_proc, args=(proc, first), daemon=True).start()
 
-    # Brief check — if mpv dies immediately, surface error
     time.sleep(1.2)
     if proc.poll() is not None:
         err = ""
@@ -349,9 +386,9 @@ def play(url: str) -> dict[str, Any]:
             _state["playing"] = False
             _state["error"] = err or f"mpv exited with code {proc.returncode}"
         _cleanup_ipc()
-        return {"ok": False, "error": _state["error"], "title": title, "sink": sink}
+        return {"ok": False, "error": _state["error"], "title": display, "sink": sink}
 
-    return {"ok": True, "title": title, "url": url, "sink": sink, **get_status()}
+    return {"ok": True, "title": display, "url": first, "sink": sink, **get_status()}
 
 
 def pause() -> dict[str, Any]:

@@ -99,6 +99,43 @@ const STRINGS = {
   working: "עובד…",
   busyTimeout: "הפעולה ארכה מדי — מסתיר את המסך. אפשר לרענן אם משהו נתקע",
   requestTimeout: "השרת לא ענה בזמן",
+  noFiles: "אין קבצים עדיין",
+  dropHint: "העלה מהטלפון או זרוק קבצים לתיקיית media במחשב",
+  noPlaylists: "אין פלייליסטים",
+  noHistory: "אין האזנות אחרונות",
+  upload: "העלה",
+  uploading: "מעלה…",
+  uploaded: "הועלה",
+  uploadFailed: "העלאה נכשלה",
+  deleteFileConfirm: (n) => `למחוק את "${n}"?`,
+  savingUrl: "שומר לספרייה ברקע…",
+  saveStarted: "שומר ברקע — תופיע בספרייה כשיסתיים",
+  saveFailed: "שמירה לספרייה נכשלה",
+  saveDone: (t) => t ? `נשמר: ${t}` : "נשמר לספרייה",
+  pasteUrlToSave: "הדבק קישור לשמירה",
+  enterPlaylistName: "הזן שם לפלייליסט",
+  playlistCreated: (n) => `נוצר: ${n}`,
+  playlistEmpty: "הפלייליסט ריק",
+  addToPlaylist: "הוסף לפלייליסט",
+  addedToPlaylist: "נוסף לפלייליסט",
+  createPlaylistFirst: "צור פלייליסט קודם",
+  playingPlaylist: (n) => `מנגן: ${n}`,
+  recNeedHttps: "הקלטה מהמיקרופון דורשת HTTPS. אפשר להעלות קובץ קולי.",
+  recDenied: "אין גישה למיקרופון",
+  recUnsupported: "הדפדפן לא תומך בהקלטה",
+  recHintIdle: "לחץ כדי להקליט הודעה מהטלפון ולשלוח לרמקול בבית.",
+  recHintRecording: "מקליט… בחר שלח או שמור כשתסיים.",
+  recSending: "שולח לרמקול…",
+  recSaved: "ההקלטה נשמרה",
+  recSent: "נשלח לרמקול",
+  recFailed: "הקלטה נכשלה",
+  recUploadPlay: "מעלה ומנגן…",
+  kindUploads: "הועלה",
+  kindRecordings: "הקלטה",
+  kindSaved: "נשמר",
+  kindExtra: "תיקייה",
+  tracks: (n) => `${n} רצועות`,
+  addCurrentUrl: "הוסף את הקישור הנוכחי",
 };
 
 const els = {
@@ -143,6 +180,28 @@ const els = {
   adminInvitesGroup: $("#adminInvitesGroup"),
   adminDevicesGroup: $("#adminDevicesGroup"),
   authWhoami: $("#authWhoami"),
+  saveUrlBtn: $("#saveUrlBtn"),
+  sourceTabs: $("#sourceTabs"),
+  uploadBtn: $("#uploadBtn"),
+  uploadFile: $("#uploadFile"),
+  libraryGroup: $("#libraryGroup"),
+  playlistName: $("#playlistName"),
+  createPlaylistBtn: $("#createPlaylistBtn"),
+  playlistsGroup: $("#playlistsGroup"),
+  recBtn: $("#recBtn"),
+  recTimer: $("#recTimer"),
+  recHint: $("#recHint"),
+  recActions: $("#recActions"),
+  recSendBtn: $("#recSendBtn"),
+  recSaveBtn: $("#recSaveBtn"),
+  recDiscardBtn: $("#recDiscardBtn"),
+  recUploadBtn: $("#recUploadBtn"),
+  recFile: $("#recFile"),
+  recSecureNote: $("#recSecureNote"),
+  historyGroup: $("#historyGroup"),
+  plPicker: $("#plPicker"),
+  plPickerList: $("#plPickerList"),
+  plPickerCancel: $("#plPickerCancel"),
 };
 
 const LS_URL = "btSpeaker.lastUrl";
@@ -162,6 +221,17 @@ let playerPaused = false;
 let scrubbing = false;
 let lastDuration = 0;
 let pollMs = 4000;
+let libraryCache = [];
+let playlistsCache = [];
+let savePollTimer = null;
+let recRecorder = null;
+let recChunks = [];
+let recStream = null;
+let recTimerId = null;
+let recSeconds = 0;
+let recPendingBlob = null;
+let recPendingName = "recording.webm";
+let plPickerCallback = null;
 
 function getToken() {
   return localStorage.getItem(LS_TOKEN) || "";
@@ -174,12 +244,13 @@ function setToken(t) {
 
 async function api(path, opts = {}) {
   const { timeoutMs = 25000, ...fetchOpts } = opts;
-  const headers = {
-    "Content-Type": "application/json",
-    ...(fetchOpts.headers || {}),
-  };
+  const headers = { ...(fetchOpts.headers || {}) };
   const token = getToken();
   if (token) headers["X-Api-Token"] = token;
+  const isForm = typeof FormData !== "undefined" && fetchOpts.body instanceof FormData;
+  if (!isForm && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1147,6 +1218,599 @@ async function searchYoutube() {
   }
 }
 
+function kindLabel(kind) {
+  if (kind === "recordings") return STRINGS.kindRecordings;
+  if (kind === "saved") return STRINGS.kindSaved;
+  if (kind === "extra") return STRINGS.kindExtra;
+  return STRINGS.kindUploads;
+}
+
+function fmtSize(n) {
+  const x = Number(n) || 0;
+  if (x < 1024) return `${x} B`;
+  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`;
+  return `${(x / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function switchTab(name) {
+  document.querySelectorAll(".seg-btn").forEach((btn) => {
+    const on = btn.dataset.tab === name;
+    btn.classList.toggle("is-active", on);
+    btn.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".tab-pane").forEach((pane) => {
+    pane.hidden = pane.dataset.tab !== name;
+  });
+  if (name === "library") {
+    refreshLibrary();
+    refreshPlaylists();
+  } else if (name === "history") {
+    refreshHistory();
+  } else if (name === "record") {
+    updateRecSecureNote();
+  }
+}
+
+function emptyCell(title, sub) {
+  return `
+    <div class="cell empty">
+      <div class="cell-body">
+        <div class="cell-title muted">${escapeHtml(title)}</div>
+        ${sub ? `<div class="cell-sub">${escapeHtml(sub)}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+async function refreshLibrary() {
+  const data = await api("/api/library");
+  if (!data.ok) return;
+  libraryCache = data.files || [];
+  renderLibrary(libraryCache);
+  const job = data.save_job || {};
+  if (job.status === "running") {
+    scheduleSavePoll();
+  } else if (job.status === "ok") {
+    clearTimeout(savePollTimer);
+    if (job.title) toast(STRINGS.saveDone(job.title));
+  } else if (job.status === "error" && job.error) {
+    clearTimeout(savePollTimer);
+    toast(job.error);
+  }
+}
+
+function renderLibrary(files) {
+  const group = els.libraryGroup;
+  group.innerHTML = "";
+  if (!files.length) {
+    group.innerHTML = emptyCell(STRINGS.noFiles, STRINGS.dropHint);
+    return;
+  }
+  for (const f of files) {
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    const sub = [kindLabel(f.kind), fmtSize(f.size)].filter(Boolean).join(" · ");
+    cell.innerHTML = `
+      <button type="button" class="file-row">
+        <div class="cell-body">
+          <div class="cell-title">${escapeHtml(f.title || f.name)}</div>
+          <div class="cell-sub">${escapeHtml(sub)}</div>
+        </div>
+      </button>
+      <div class="cell-actions-inline"></div>`;
+    cell.querySelector(".file-row").addEventListener("click", () => playFile(f.id, f.title || f.name));
+    const actions = cell.querySelector(".cell-actions-inline");
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "text-btn";
+    add.textContent = "+";
+    add.title = STRINGS.addToPlaylist;
+    add.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pickPlaylist((pl) => addToPlaylist(pl.id, { kind: "file", file_id: f.id, title: f.title || f.name }));
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "text-btn danger-text";
+    del.textContent = STRINGS.delete;
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteLibraryFile(f.id, f.title || f.name);
+    });
+    actions.appendChild(add);
+    actions.appendChild(del);
+    group.appendChild(cell);
+  }
+}
+
+async function playFile(fileId, title) {
+  if (!hasSpeaker) {
+    toast(STRINGS.noBtSpeaker);
+    return;
+  }
+  setBusy(true, STRINGS.startingPlayback);
+  try {
+    const data = await api("/api/play", {
+      method: "POST",
+      body: JSON.stringify({ file_id: fileId }),
+    });
+    if (data.ok) {
+      toast(STRINGS.playingTitle(data.title || title || STRINGS.playingStatus));
+      setStatus(STRINGS.playingTitle(data.title || title || ""));
+    } else if (looksLikeNoSpeakerError(data.error)) {
+      toast(STRINGS.noBtSpeaker);
+    } else {
+      toast(data.error || STRINGS.playFailed);
+    }
+    await refreshStatus();
+  } catch {
+    toast(STRINGS.playFailed);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteLibraryFile(fileId, name) {
+  if (!confirm(STRINGS.deleteFileConfirm(name || fileId))) return;
+  const data = await api("/api/library/delete", {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId }),
+  });
+  if (!data.ok) {
+    toast(data.error || STRINGS.deleteFailed);
+    return;
+  }
+  toast(STRINGS.deleted);
+  await refreshLibrary();
+}
+
+async function uploadFiles(fileList, { play = false, kind = "uploads" } = {}) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+  setBusy(true, play ? STRINGS.recUploadPlay : STRINGS.uploading);
+  try {
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      fd.append("kind", kind);
+      if (play) fd.append("play", "true");
+      const path = play ? "/api/record" : "/api/library";
+      const data = await api(path, { method: "POST", body: fd, timeoutMs: 90000 });
+      if (!data.ok) {
+        toast(data.error || STRINGS.uploadFailed);
+        continue;
+      }
+      if (play) {
+        if (data.played) toast(STRINGS.recSent);
+        else if (data.play_error) toast(data.play_error);
+        else toast(STRINGS.recSaved);
+      } else {
+        toast(STRINGS.uploaded);
+      }
+    }
+    await refreshLibrary();
+    await refreshStatus();
+  } finally {
+    setBusy(false);
+  }
+}
+
+function scheduleSavePoll() {
+  clearTimeout(savePollTimer);
+  savePollTimer = setTimeout(async () => {
+    const data = await api("/api/library");
+    if (!data.ok) return;
+    libraryCache = data.files || [];
+    if (!document.getElementById("tab-library").hidden) renderLibrary(libraryCache);
+    const job = data.save_job || {};
+    if (job.status === "running") {
+      scheduleSavePoll();
+    } else if (job.status === "ok") {
+      toast(STRINGS.saveDone(job.title));
+      if (!document.getElementById("tab-library").hidden) renderLibrary(libraryCache);
+    } else if (job.status === "error") {
+      toast(job.error || STRINGS.saveFailed);
+    }
+  }, 2500);
+}
+
+async function saveCurrentUrl() {
+  const url = (els.ytUrl.value || "").trim();
+  if (!url) {
+    toast(STRINGS.pasteUrlToSave);
+    return;
+  }
+  const data = await api("/api/library/save-url", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+  if (!data.ok) {
+    toast(data.error || STRINGS.saveFailed);
+    return;
+  }
+  toast(STRINGS.saveStarted);
+  scheduleSavePoll();
+}
+
+async function refreshPlaylists() {
+  const data = await api("/api/playlists");
+  if (!data.ok) return;
+  playlistsCache = data.playlists || [];
+  renderPlaylists(playlistsCache);
+}
+
+function renderPlaylists(list) {
+  const group = els.playlistsGroup;
+  group.innerHTML = "";
+  if (!list.length) {
+    group.innerHTML = emptyCell(STRINGS.noPlaylists);
+    return;
+  }
+  for (const pl of list) {
+    const items = pl.items || [];
+    const wrap = document.createElement("div");
+    wrap.className = "cell column";
+    wrap.innerHTML = `
+      <div class="pl-item-row">
+        <div class="cell-body">
+          <div class="cell-title">${escapeHtml(pl.name)}</div>
+          <div class="cell-sub">${escapeHtml(STRINGS.tracks(items.length))}</div>
+        </div>
+        <div class="cell-actions-inline"></div>
+      </div>
+      <div class="pl-tracks"></div>`;
+    const actions = wrap.querySelector(".cell-actions-inline");
+    const playBtn = document.createElement("button");
+    playBtn.type = "button";
+    playBtn.className = "text-btn";
+    playBtn.textContent = "נגן";
+    playBtn.addEventListener("click", () => playPlaylist(pl.id, pl.name));
+    const addUrl = document.createElement("button");
+    addUrl.type = "button";
+    addUrl.className = "text-btn";
+    addUrl.textContent = "+ קישור";
+    addUrl.title = STRINGS.addCurrentUrl;
+    addUrl.addEventListener("click", () => {
+      const url = (els.ytUrl.value || "").trim();
+      if (!url) {
+        toast(STRINGS.pasteUrlFirst);
+        return;
+      }
+      addToPlaylist(pl.id, { kind: "url", url, title: url });
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "text-btn danger-text";
+    del.textContent = STRINGS.delete;
+    del.addEventListener("click", () => deletePlaylist(pl.id, pl.name));
+    actions.appendChild(playBtn);
+    actions.appendChild(addUrl);
+    actions.appendChild(del);
+    const tracks = wrap.querySelector(".pl-tracks");
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.className = "pl-item-row";
+      row.style.paddingTop = "8px";
+      const title = it.title || it.url || it.file_id || "—";
+      row.innerHTML = `
+        <div class="cell-body">
+          <div class="cell-sub">${escapeHtml(title)}</div>
+        </div>`;
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "text-btn danger-text";
+      rm.textContent = "×";
+      rm.addEventListener("click", () => removePlaylistItem(pl.id, it.id));
+      row.appendChild(rm);
+      tracks.appendChild(row);
+    }
+    group.appendChild(wrap);
+  }
+}
+
+async function createPlaylist() {
+  const name = (els.playlistName.value || "").trim();
+  if (!name) {
+    toast(STRINGS.enterPlaylistName);
+    return;
+  }
+  const data = await api("/api/playlists", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  if (!data.ok) {
+    toast(data.error || STRINGS.failed);
+    return;
+  }
+  els.playlistName.value = "";
+  toast(STRINGS.playlistCreated(name));
+  await refreshPlaylists();
+}
+
+async function deletePlaylist(id, name) {
+  if (!confirm(STRINGS.deleteConfirm(name || id))) return;
+  const data = await api(`/api/playlists/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
+  if (!data.ok) {
+    toast(data.error || STRINGS.deleteFailed);
+    return;
+  }
+  toast(STRINGS.deleted);
+  await refreshPlaylists();
+}
+
+async function addToPlaylist(playlistId, item) {
+  const data = await api(`/api/playlists/${encodeURIComponent(playlistId)}/items`, {
+    method: "POST",
+    body: JSON.stringify(item),
+  });
+  if (!data.ok) {
+    toast(data.error || STRINGS.failed);
+    return;
+  }
+  toast(STRINGS.addedToPlaylist);
+  await refreshPlaylists();
+}
+
+async function removePlaylistItem(playlistId, itemId) {
+  const data = await api(
+    `/api/playlists/${encodeURIComponent(playlistId)}/items/${encodeURIComponent(itemId)}`,
+    { method: "DELETE", body: "{}" },
+  );
+  if (!data.ok) {
+    toast(data.error || STRINGS.deleteFailed);
+    return;
+  }
+  await refreshPlaylists();
+}
+
+async function playPlaylist(id, name) {
+  if (!hasSpeaker) {
+    toast(STRINGS.noBtSpeaker);
+    return;
+  }
+  setBusy(true, STRINGS.startingPlayback);
+  try {
+    const data = await api("/api/play/playlist", {
+      method: "POST",
+      body: JSON.stringify({ playlist_id: id }),
+    });
+    if (data.ok) {
+      toast(STRINGS.playingPlaylist(data.title || name));
+      setStatus(STRINGS.playingPlaylist(data.title || name));
+    } else if (looksLikeNoSpeakerError(data.error)) {
+      toast(STRINGS.noBtSpeaker);
+    } else {
+      toast(data.error || STRINGS.playFailed);
+    }
+    await refreshStatus();
+  } catch {
+    toast(STRINGS.playFailed);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function pickPlaylist(cb) {
+  if (!playlistsCache.length) {
+    toast(STRINGS.createPlaylistFirst);
+    switchTab("library");
+    return;
+  }
+  if (playlistsCache.length === 1) {
+    cb(playlistsCache[0]);
+    return;
+  }
+  plPickerCallback = cb;
+  els.plPickerList.innerHTML = "";
+  for (const pl of playlistsCache) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "pl-pick-btn";
+    btn.textContent = pl.name;
+    btn.addEventListener("click", () => {
+      const fn = plPickerCallback;
+      closePlaylistPicker();
+      if (fn) fn(pl);
+    });
+    els.plPickerList.appendChild(btn);
+  }
+  els.plPicker.hidden = false;
+}
+
+function closePlaylistPicker() {
+  els.plPicker.hidden = true;
+  plPickerCallback = null;
+}
+
+async function refreshHistory() {
+  const data = await api("/api/history");
+  if (!data.ok) return;
+  renderHistory(data.items || []);
+}
+
+function renderHistory(items) {
+  const group = els.historyGroup;
+  group.innerHTML = "";
+  if (!items.length) {
+    group.innerHTML = emptyCell(STRINGS.noHistory);
+    return;
+  }
+  for (const h of items) {
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    const when = fmtWhen(h.played_at);
+    cell.innerHTML = `
+      <button type="button" class="file-row">
+        <div class="cell-body">
+          <div class="cell-title">${escapeHtml(h.title || "—")}</div>
+          <div class="cell-sub">${escapeHtml(when)}</div>
+        </div>
+      </button>`;
+    cell.querySelector(".file-row").addEventListener("click", () => replayHistory(h));
+    group.appendChild(cell);
+  }
+}
+
+async function replayHistory(h) {
+  if (h.source === "playlist" && h.playlist_id) {
+    await playPlaylist(h.playlist_id, h.title);
+    return;
+  }
+  if (h.file_id) {
+    await playFile(h.file_id, h.title);
+    return;
+  }
+  if (h.url) {
+    els.ytUrl.value = h.url;
+    await playUrl(h.url);
+  }
+}
+
+function updateRecSecureNote() {
+  const ok = window.isSecureContext && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  els.recSecureNote.hidden = ok;
+}
+
+function recMime() {
+  const types = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+  ];
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+  return types.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+}
+
+function recExt(mime) {
+  if ((mime || "").includes("mp4")) return "m4a";
+  if ((mime || "").includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function setRecTimer(sec) {
+  recSeconds = sec;
+  els.recTimer.textContent = fmtTime(sec);
+}
+
+function stopRecTracks() {
+  if (recStream) {
+    recStream.getTracks().forEach((t) => t.stop());
+    recStream = null;
+  }
+  if (recTimerId) {
+    clearInterval(recTimerId);
+    recTimerId = null;
+  }
+}
+
+async function startRecording() {
+  updateRecSecureNote();
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    toast(STRINGS.recNeedHttps);
+    return;
+  }
+  if (!window.MediaRecorder) {
+    toast(STRINGS.recUnsupported);
+    return;
+  }
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    toast(STRINGS.recDenied);
+    return;
+  }
+  recChunks = [];
+  recPendingBlob = null;
+  const mime = recMime();
+  try {
+    recRecorder = mime ? new MediaRecorder(recStream, { mimeType: mime }) : new MediaRecorder(recStream);
+  } catch {
+    toast(STRINGS.recUnsupported);
+    stopRecTracks();
+    return;
+  }
+  recRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size) recChunks.push(e.data);
+  };
+  recRecorder.onstop = () => {
+    const type = recRecorder?.mimeType || mime || "audio/webm";
+    recPendingBlob = new Blob(recChunks, { type });
+    recPendingName = `recording_${Date.now()}.${recExt(type)}`;
+    stopRecTracks();
+    els.recBtn.classList.remove("is-recording");
+    els.recActions.hidden = false;
+    els.recHint.textContent = STRINGS.recHintRecording;
+  };
+  recRecorder.start(250);
+  els.recBtn.classList.add("is-recording");
+  els.recActions.hidden = true;
+  els.recHint.textContent = STRINGS.recHintRecording;
+  setRecTimer(0);
+  recTimerId = setInterval(() => setRecTimer(recSeconds + 1), 1000);
+}
+
+function stopRecording() {
+  if (recRecorder && recRecorder.state === "recording") {
+    recRecorder.stop();
+  }
+}
+
+function discardRecording() {
+  recPendingBlob = null;
+  recChunks = [];
+  if (recRecorder && recRecorder.state === "recording") recRecorder.stop();
+  stopRecTracks();
+  els.recBtn.classList.remove("is-recording");
+  els.recActions.hidden = true;
+  els.recHint.textContent = STRINGS.recHintIdle;
+  setRecTimer(0);
+}
+
+async function finishRecording(play) {
+  if (recRecorder && recRecorder.state === "recording") {
+    await new Promise((resolve) => {
+      recRecorder.addEventListener("stop", resolve, { once: true });
+      recRecorder.stop();
+    });
+  }
+  if (!recPendingBlob || !recPendingBlob.size) {
+    toast(STRINGS.recFailed);
+    discardRecording();
+    return;
+  }
+  setBusy(true, play ? STRINGS.recSending : STRINGS.uploading);
+  try {
+    const fd = new FormData();
+    fd.append("file", recPendingBlob, recPendingName);
+    fd.append("play", play ? "true" : "false");
+    const data = await api("/api/record", { method: "POST", body: fd, timeoutMs: 90000 });
+    if (!data.ok) {
+      toast(data.error || STRINGS.recFailed);
+      return;
+    }
+    if (play) {
+      if (data.played) toast(STRINGS.recSent);
+      else toast(data.play_error || STRINGS.recSaved);
+    } else {
+      toast(STRINGS.recSaved);
+    }
+    discardRecording();
+    await refreshStatus();
+  } catch {
+    toast(STRINGS.recFailed);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function onRecBtn() {
+  if (recRecorder && recRecorder.state === "recording") {
+    stopRecording();
+    return;
+  }
+  startRecording();
+}
+
 function toggleBtPanel() {
   const open = els.btPanel.hidden;
   els.btPanel.hidden = !open;
@@ -1189,6 +1853,34 @@ function bind() {
   els.ytSearch.addEventListener("keydown", (e) => {
     if (e.key === "Enter") searchYoutube();
   });
+  els.saveUrlBtn.addEventListener("click", saveCurrentUrl);
+  els.sourceTabs.addEventListener("click", (e) => {
+    const btn = e.target.closest(".seg-btn");
+    if (!btn) return;
+    switchTab(btn.dataset.tab);
+  });
+  els.uploadBtn.addEventListener("click", () => els.uploadFile.click());
+  els.uploadFile.addEventListener("change", () => {
+    uploadFiles(els.uploadFile.files);
+    els.uploadFile.value = "";
+  });
+  els.createPlaylistBtn.addEventListener("click", createPlaylist);
+  els.playlistName.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") createPlaylist();
+  });
+  els.recBtn.addEventListener("click", onRecBtn);
+  els.recSendBtn.addEventListener("click", () => finishRecording(true));
+  els.recSaveBtn.addEventListener("click", () => finishRecording(false));
+  els.recDiscardBtn.addEventListener("click", discardRecording);
+  els.recUploadBtn.addEventListener("click", () => els.recFile.click());
+  els.recFile.addEventListener("change", () => {
+    uploadFiles(els.recFile.files, { play: true, kind: "recordings" });
+    els.recFile.value = "";
+  });
+  els.plPickerCancel.addEventListener("click", closePlaylistPicker);
+  els.plPicker.addEventListener("click", (e) => {
+    if (e.target === els.plPicker) closePlaylistPicker();
+  });
   els.createInviteBtn.addEventListener("click", createInvite);
   els.refreshAccessBtn.addEventListener("click", refreshAccessAdmin);
   els.copyInviteBtn.addEventListener("click", () =>
@@ -1229,6 +1921,7 @@ async function init() {
   bind();
   setPlayPauseIcon(false);
   updatePlaybackEnabled();
+  updateRecSecureNote();
   await refreshStatus();
   await refreshDevices();
   schedulePoll();

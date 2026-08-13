@@ -12,12 +12,15 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import auth_store
 import bluetooth_ctl as bt
+import library
+import media_store
 import player
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 
 app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
+app.config["MAX_CONTENT_LENGTH"] = library.MAX_UPLOAD_BYTES
 
 
 def _extract_token() -> str:
@@ -85,6 +88,11 @@ def _no_cache_api(resp):
     if request.path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({"ok": False, "error": "File too large (max 80MB)"}), 413
 
 
 @app.get("/")
@@ -333,26 +341,319 @@ def _bt_speaker_connected() -> bool:
         return False
 
 
+def _ensure_speaker_ready():
+    """Return (error_response, status_code) or (None, None) if ready."""
+    if not _bt_speaker_connected():
+        return jsonify({"ok": False, "error": "No Bluetooth speaker connected"}), 400
+    try:
+        st = bt.get_status()
+        if not st.get("powered"):
+            bt.power_on()
+    except Exception:
+        pass
+    return None, None
+
+
+def _record_play_history(
+    result: dict,
+    *,
+    source: str,
+    url: str | None = None,
+    file_id: str | None = None,
+    playlist_id: str | None = None,
+    title: str | None = None,
+) -> None:
+    if not result.get("ok"):
+        return
+    media_store.add_history(
+        title=title or result.get("title"),
+        source=source,
+        url=url or result.get("url"),
+        file_id=file_id,
+        playlist_id=playlist_id,
+    )
+
+
 @app.post("/api/play")
 @require_token
 def play():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or data.get("link") or "").strip()
-    if not url:
-        return jsonify({"ok": False, "error": "Missing url"}), 400
+    file_id = (data.get("file_id") or "").strip()
+    if not url and not file_id:
+        return jsonify({"ok": False, "error": "Missing url or file_id"}), 400
     try:
-        if not _bt_speaker_connected():
-            return jsonify(
-                {"ok": False, "error": "No Bluetooth speaker connected"}
-            ), 400
-        st = bt.get_status()
-        if not st.get("powered"):
-            bt.power_on()
-        result = player.play(url)
+        err, code = _ensure_speaker_ready()
+        if err is not None:
+            return err, code
+        if file_id:
+            item = library.resolve(file_id)
+            if not item:
+                return jsonify({"ok": False, "error": "File not found"}), 404
+            result = player.play(str(item["path"]), title=item.get("title"))
+            _record_play_history(
+                result,
+                source="file",
+                file_id=file_id,
+                title=item.get("title"),
+            )
+        else:
+            result = player.play(url)
+            _record_play_history(result, source="url", url=url)
         code = 200 if result.get("ok") else 500
         return jsonify(result), code
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/play/playlist")
+@require_token
+def play_playlist():
+    data = request.get_json(silent=True) or {}
+    playlist_id = (data.get("playlist_id") or data.get("id") or "").strip()
+    if not playlist_id:
+        return jsonify({"ok": False, "error": "Missing playlist_id"}), 400
+    pl = media_store.get_playlist(playlist_id)
+    if not pl:
+        return jsonify({"ok": False, "error": "Playlist not found"}), 404
+    sources: list[str] = []
+    for it in pl.get("items") or []:
+        if it.get("kind") == "file" and it.get("file_id"):
+            item = library.resolve(it["file_id"])
+            if item:
+                sources.append(str(item["path"]))
+        elif it.get("kind") == "url" and it.get("url"):
+            sources.append(it["url"])
+    if not sources:
+        return jsonify({"ok": False, "error": "Playlist is empty"}), 400
+    try:
+        err, code = _ensure_speaker_ready()
+        if err is not None:
+            return err, code
+        result = player.play_list(sources, title=pl.get("name"))
+        _record_play_history(
+            result,
+            source="playlist",
+            playlist_id=playlist_id,
+            title=pl.get("name"),
+        )
+        code = 200 if result.get("ok") else 500
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/library")
+@require_token
+def library_list():
+    try:
+        return jsonify(library.list_files())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "files": []}), 500
+
+
+@app.post("/api/library")
+@require_token
+def library_upload():
+    f = request.files.get("file") or request.files.get("audio")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "Missing file"}), 400
+    kind = (request.form.get("kind") or request.args.get("kind") or "uploads").strip()
+    try:
+        data = f.read()
+        result = library.save_bytes(f.filename, data, kind=kind)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.delete("/api/library/<file_id>")
+@require_token
+def library_delete(file_id: str):
+    try:
+        result = library.delete_file(file_id)
+        code = 200 if result.get("ok") else 404
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/library/delete")
+@require_token
+def library_delete_post():
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get("file_id") or data.get("id") or "").strip()
+    if not file_id:
+        return jsonify({"ok": False, "error": "Missing file_id"}), 400
+    try:
+        result = library.delete_file(file_id)
+        code = 200 if result.get("ok") else 404
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/library/save-url")
+@require_token
+def library_save_url():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or data.get("link") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "Missing url"}), 400
+    try:
+        result = library.save_url_async(url)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/record")
+@require_token
+def record_upload():
+    f = request.files.get("file") or request.files.get("audio")
+    if not f:
+        return jsonify({"ok": False, "error": "Missing file"}), 400
+    play_now = str(request.form.get("play") or request.args.get("play") or "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    filename = f.filename or "recording.webm"
+    if not Path(filename).suffix:
+        filename = filename + ".webm"
+    try:
+        data = f.read()
+        result = library.save_bytes(filename, data, kind="recordings")
+        if not result.get("ok"):
+            return jsonify(result), 400
+        file_info = result.get("file") or {}
+        if play_now:
+            err, code = _ensure_speaker_ready()
+            if err is not None:
+                return jsonify({**result, "played": False, "play_error": "No Bluetooth speaker connected"}), 200
+            item = library.resolve(file_info.get("id") or "")
+            if item:
+                played = player.play(str(item["path"]), title=item.get("title") or "הקלטה")
+                _record_play_history(
+                    played,
+                    source="file",
+                    file_id=file_info.get("id"),
+                    title=item.get("title") or "הקלטה",
+                )
+                result["played"] = bool(played.get("ok"))
+                result["player"] = played
+                if not played.get("ok"):
+                    result["play_error"] = played.get("error")
+            else:
+                result["played"] = False
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/playlists")
+@require_token
+def playlists_list():
+    try:
+        pls = media_store.list_playlists()
+        return jsonify({"ok": True, "playlists": pls, "count": len(pls)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "playlists": []}), 500
+
+
+@app.post("/api/playlists")
+@require_token
+def playlists_create():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Provide a playlist name"}), 400
+    try:
+        pl = media_store.create_playlist(name)
+        return jsonify({"ok": True, "playlist": pl})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.patch("/api/playlists/<playlist_id>")
+@require_token
+def playlists_rename(playlist_id: str):
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    try:
+        result = media_store.rename_playlist(playlist_id, name)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.delete("/api/playlists/<playlist_id>")
+@require_token
+def playlists_delete(playlist_id: str):
+    try:
+        result = media_store.delete_playlist(playlist_id)
+        code = 200 if result.get("ok") else 404
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/playlists/<playlist_id>/items")
+@require_token
+def playlists_add_item(playlist_id: str):
+    data = request.get_json(silent=True) or {}
+    kind = (data.get("kind") or "").strip()
+    try:
+        result = media_store.add_item(
+            playlist_id,
+            kind=kind,
+            title=data.get("title"),
+            file_id=data.get("file_id"),
+            url=data.get("url") or data.get("link"),
+        )
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.delete("/api/playlists/<playlist_id>/items/<item_id>")
+@require_token
+def playlists_remove_item(playlist_id: str, item_id: str):
+    try:
+        result = media_store.remove_item(playlist_id, item_id)
+        code = 200 if result.get("ok") else 404
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/playlists/<playlist_id>/items/reorder")
+@require_token
+def playlists_reorder(playlist_id: str):
+    data = request.get_json(silent=True) or {}
+    item_ids = data.get("item_ids") or data.get("ids") or []
+    if not isinstance(item_ids, list):
+        return jsonify({"ok": False, "error": "item_ids must be a list"}), 400
+    try:
+        result = media_store.reorder_items(playlist_id, item_ids)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/history")
+@require_token
+def history_list():
+    try:
+        items = media_store.list_history()
+        return jsonify({"ok": True, "items": items, "count": len(items)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "items": []}), 500
 
 
 @app.post("/api/stop")
@@ -456,6 +757,8 @@ def volume():
 
 def main() -> None:
     auth_store.ensure_store()
+    media_store.ensure_store()
+    library.ensure_dirs()
     host = os.environ.get("BT_SPEAKER_HOST", "0.0.0.0")
     port = int(os.environ.get("BT_SPEAKER_PORT", "8765"))
     print(f"BT Speaker Remote → http://{host}:{port}")
