@@ -270,8 +270,10 @@ def _save_url_worker(url: str) -> None:
     dest_dir = MEDIA_ROOT / "saved"
     dest_dir.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(dest_dir / "%(title)s [%(id)s].%(ext)s")
+    from player import YTDLP_PREFIX
+
     cmd = [
-        "yt-dlp",
+        *YTDLP_PREFIX,
         "-f",
         "bestaudio/best",
         "--no-playlist",

@@ -269,7 +269,7 @@ def bluetooth_power():
 @require_token
 def bluetooth_scan():
     data = request.get_json(silent=True) or {}
-    seconds = float(data.get("seconds", 12))
+    seconds = float(data.get("seconds", 18))
     seconds = max(5, min(30, seconds))
     wait = bool(data.get("wait", True))
     try:
@@ -298,7 +298,9 @@ def bluetooth_connect():
     if not address:
         return jsonify({"ok": False, "error": "Missing address"}), 400
     try:
-        return jsonify(bt.connect(address))
+        result = bt.connect(address)
+        player.ensure_bt_sink_default()
+        return jsonify(result)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -386,11 +388,12 @@ def play():
         err, code = _ensure_speaker_ready()
         if err is not None:
             return err, code
+        title = (data.get("title") or "").strip() or None
         if file_id:
             item = library.resolve(file_id)
             if not item:
                 return jsonify({"ok": False, "error": "File not found"}), 404
-            result = player.play(str(item["path"]), title=item.get("title"))
+            result = player.play(str(item["path"]), title=item.get("title") or title)
             _record_play_history(
                 result,
                 source="file",
@@ -398,8 +401,8 @@ def play():
                 title=item.get("title"),
             )
         else:
-            result = player.play(url)
-            _record_play_history(result, source="url", url=url)
+            result = player.play(url, title=title)
+            _record_play_history(result, source="url", url=url, title=title)
         code = 200 if result.get("ok") else 500
         return jsonify(result), code
     except Exception as e:

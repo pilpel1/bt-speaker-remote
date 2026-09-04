@@ -77,10 +77,11 @@ const STRINGS = {
   deviceForgotten: "המכשיר נשכח",
   forgetFailed: "שכחה נכשלה",
   pasteUrlFirst: "הדבק קישור יוטיוב קודם",
-  startingStream: "מתחיל השמעה…",
-  startingPlayback: "מתחיל ניגון…",
+  startingStream: "מוריד מיוטיוב ואז מנגן…",
+  startingPlayback: "מוריד מיוטיוב…",
   playingTitle: (t) => `מתנגן: ${t}`,
   playingStatus: "מתנגן",
+  loadingTrack: "טוען…",
   playFailed: "ניגון נכשל",
   noBtSpeaker: "אין רמקול בלוטות׳ מחובר — חבר רמקול כדי לנגן",
   stopped: "נעצר",
@@ -211,6 +212,7 @@ let busyCount = 0;
 let busySafetyTimer = null;
 let statusTimer = null;
 let volTimer = null;
+let volDragging = false;
 let authPrompted = false;
 let isAdmin = false;
 let myDeviceId = null;
@@ -428,7 +430,7 @@ function updateSeekUI(timePos, duration, percent) {
   if (!Number.isFinite(pos)) pos = 0;
 
   els.timeCurrent.textContent = fmtTime(pos);
-  els.timeDuration.textContent = dur > 0 ? fmtTime(dur) : "0:00";
+  els.timeDuration.textContent = dur > 0 ? fmtTime(dur) : (playerPlaying ? STRINGS.loadingTrack : "0:00");
 
   const max = 1000;
   els.seekBar.max = String(max);
@@ -613,7 +615,7 @@ function applyStatus(data) {
 
   updateSeekUI(p.time_pos, p.duration, p.percent);
 
-  if (typeof data.volume === "number") {
+  if (typeof data.volume === "number" && !volDragging) {
     els.volSlider.value = String(data.volume);
     els.volVal.textContent = `${data.volume}%`;
   }
@@ -910,7 +912,7 @@ async function scan() {
     els.btPower.checked = true;
     const data = await api("/api/bluetooth/scan", {
       method: "POST",
-      body: JSON.stringify({ seconds: 12, wait: true }),
+      body: JSON.stringify({ seconds: 18, wait: true }),
     });
     if (data.devices) {
       renderConnected(data.devices);
@@ -1022,7 +1024,7 @@ function looksLikeNoSpeakerError(err) {
   );
 }
 
-async function playUrl(url) {
+async function playUrl(url, title) {
   if (!url) {
     toast(STRINGS.pasteUrlFirst);
     return;
@@ -1035,9 +1037,12 @@ async function playUrl(url) {
   setBusy(true, STRINGS.startingStream);
   setStatus(STRINGS.startingPlayback);
   try {
+    const body = { url };
+    if (title) body.title = title;
     const data = await api("/api/play", {
       method: "POST",
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
+      timeoutMs: 130000,
     });
     if (data.ok) {
       toast(data.title ? STRINGS.playingTitle(data.title) : STRINGS.playingStatus);
@@ -1155,13 +1160,26 @@ async function onSeekCommit() {
 function onVolumeInput() {
   const v = els.volSlider.value;
   els.volVal.textContent = `${v}%`;
+  volDragging = true;
   clearTimeout(volTimer);
   volTimer = setTimeout(async () => {
-    await api("/api/volume", {
-      method: "POST",
-      body: JSON.stringify({ percent: Number(v) }),
-    });
-  }, 120);
+    try {
+      const data = await api("/api/volume", {
+        method: "POST",
+        body: JSON.stringify({ percent: Number(v) }),
+      });
+      if (data && typeof data.volume === "number") {
+        els.volSlider.value = String(data.volume);
+        els.volVal.textContent = `${data.volume}%`;
+      } else if (data && data.ok === false) {
+        toast(data.error || "ווליום נכשל");
+      }
+    } catch {
+      toast("ווליום נכשל");
+    } finally {
+      volDragging = false;
+    }
+  }, 150);
 }
 
 function renderSearchResults(results) {
@@ -1187,7 +1205,7 @@ function renderSearchResults(results) {
       if (!url) return;
       els.ytUrl.value = url;
       localStorage.setItem(LS_URL, url);
-      playUrl(url);
+      playUrl(url, title);
     });
     box.appendChild(row);
   }
@@ -1661,7 +1679,7 @@ async function replayHistory(h) {
   }
   if (h.url) {
     els.ytUrl.value = h.url;
-    await playUrl(h.url);
+    await playUrl(h.url, h.title);
   }
 }
 
@@ -1832,6 +1850,12 @@ function bind() {
   els.prevBtn.addEventListener("click", prevTrack);
   els.nextBtn.addEventListener("click", nextTrack);
   els.volSlider.addEventListener("input", onVolumeInput);
+  els.volSlider.addEventListener("pointerdown", () => {
+    volDragging = true;
+  });
+  els.volSlider.addEventListener("pointerup", () => {
+    // keep true until the debounce request finishes
+  });
 
   els.seekBar.addEventListener("pointerdown", () => {
     scrubbing = true;
