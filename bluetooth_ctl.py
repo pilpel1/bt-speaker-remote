@@ -157,7 +157,8 @@ def _scan_worker(seconds: float) -> None:
     )
     assert proc.stdin is not None
     try:
-        proc.stdin.write("power on\nagent NoInputNoOutput\ndefault-agent\npairable on\nscan on\n")
+        # BCM43142 dual-mode scan starves classic inquiry; speakers are BR/EDR.
+        proc.stdin.write("power on\nagent NoInputNoOutput\ndefault-agent\npairable on\nscan bredr\n")
         proc.stdin.flush()
         end = time.time() + seconds
         _scan_until = end
@@ -175,7 +176,7 @@ def _scan_worker(seconds: float) -> None:
             proc.kill()
 
 
-def start_scan(seconds: float = 12) -> dict[str, Any]:
+def start_scan(seconds: float = 18) -> dict[str, Any]:
     global _scan_thread
     with _scan_lock:
         if _scan_thread and _scan_thread.is_alive():
@@ -187,7 +188,7 @@ def start_scan(seconds: float = 12) -> dict[str, Any]:
     return {"ok": True, "scanning": True, "seconds": seconds}
 
 
-def scan_and_wait(seconds: float = 12) -> dict[str, Any]:
+def scan_and_wait(seconds: float = 18) -> dict[str, Any]:
     start_scan(seconds)
     # Wait for worker
     t = _scan_thread
@@ -195,6 +196,29 @@ def scan_and_wait(seconds: float = 12) -> dict[str, Any]:
         t.join(timeout=seconds + 5)
     devices = list_devices()
     return {"ok": True, "devices": devices, "count": len(devices)}
+
+
+def _force_a2dp_profile(address: str) -> str | None:
+    """Lock the card on A2DP. HFP/HSP on S-233 crashed bluetoothd (AT+NREC=0)."""
+    card = f"bluez_card.{address.upper().replace(':', '_')}"
+    preferred = ("a2dp-sink-sbc_xq", "a2dp-sink")
+    chosen = None
+    for _ in range(12):
+        result = _run(["pactl", "list", "cards"], timeout=6)
+        text = result.stdout or ""
+        if card not in text:
+            time.sleep(0.4)
+            continue
+        for profile in preferred:
+            if profile in text:
+                chosen = profile
+                break
+        if chosen:
+            break
+        time.sleep(0.4)
+    if chosen:
+        _run(["pactl", "set-card-profile", card, chosen], timeout=6)
+    return chosen
 
 
 def _set_bt_default_sink(address: str) -> str | None:
@@ -234,17 +258,32 @@ def _set_bt_default_sink(address: str) -> str | None:
 def connect(address: str) -> dict[str, Any]:
     address = address.upper().strip()
     power_on()
-    # Ensure device is known — short scan if needed
     info = _bt("info", address, timeout=6)
-    if "not available" in info.lower():
-        start_scan(8)
-        time.sleep(8)
+    known = "not available" not in info.lower()
+    already_paired = bool(re.search(r"Paired:\s*yes", info, re.I)) if known else False
+
+    # Unpaired leftover / unknown device: classic inquiry, then Pair (not Connect on dead keys).
+    if not already_paired:
+        start_scan(18)
+        time.sleep(18)
         info = _bt("info", address, timeout=6)
         if "not available" in info.lower():
-            return {"ok": False, "error": f"Device {address} not found. Scan again with speaker in pairing mode."}
+            return {
+                "ok": False,
+                "error": f"Device {address} not found. Scan again with speaker in pairing mode.",
+            }
 
-    # Interactive pair/trust/connect with agent held open
-    script = f"""power on
+    if already_paired:
+        script = f"""power on
+agent NoInputNoOutput
+default-agent
+pairable on
+trust {address}
+connect {address}
+quit
+"""
+    else:
+        script = f"""power on
 agent NoInputNoOutput
 default-agent
 pairable on
@@ -258,16 +297,18 @@ quit
         input=script,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=55,
         check=False,
     )
     out = (proc.stdout or "") + (proc.stderr or "")
-    time.sleep(1.5)
+    time.sleep(2.5)
     info = _bt("info", address, timeout=6)
     connected = bool(re.search(r"Connected:\s*yes", info, re.I))
     paired = bool(re.search(r"Paired:\s*yes", info, re.I))
     sink = None
+    profile = None
     if connected:
+        profile = _force_a2dp_profile(address)
         sink = _set_bt_default_sink(address)
     name_m = re.search(r"^\s*Name:\s*(.+)$", info, re.M)
     return {
@@ -277,6 +318,7 @@ quit
         "paired": paired,
         "connected": connected,
         "audio_sink": sink,
+        "profile": profile,
         "log": out[-1500:],
         "error": None if connected else "Connection failed. Put speaker in pairing mode and try again.",
     }
