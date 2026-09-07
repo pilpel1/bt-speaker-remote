@@ -1353,6 +1353,67 @@ def play_list(
     return _play_from_index(start_i, wait_for_mpv=True, gen=gen)
 
 
+def enqueue(
+    items: list[str], title: str | None = None, *, expand: bool = True
+) -> dict[str, Any]:
+    """Append to the playing queue without stopping the current track."""
+    global _queue, _queue_titles, _queue_title, _queue_index
+    raw = _normalize_sources(items)
+    if not raw:
+        return {"ok": False, "error": "Missing sources"}
+    if expand:
+        sources, source_titles, _pl = _expand_sources(raw)
+    else:
+        sources, source_titles = raw, [""] * len(raw)
+    if not sources:
+        return {"ok": False, "error": "Missing sources"}
+    titles = list(source_titles)
+    while len(titles) < len(sources):
+        titles.append("")
+    for i, src in enumerate(sources):
+        if not titles[i]:
+            if title and i == 0:
+                titles[i] = title[:200]
+            elif not _is_http_url(src):
+                titles[i] = _local_title(src)
+    if len(sources) == 1 and title:
+        titles[0] = title[:200]
+
+    start_now = False
+    with _lock:
+        alive = bool(_proc and _proc.poll() is None) or bool(_state.get("loading"))
+        if not _queue:
+            cur = (_state.get("url") or "").strip()
+            if alive and cur:
+                _queue = [cur]
+                _queue_titles = [str(_state.get("title") or "")[:200]]
+                _queue_index = 0
+                if not _queue_title:
+                    _queue_title = _state.get("title")
+            else:
+                start_now = True
+        if not start_now:
+            # skip exact duplicate of the last queued url
+            for src, ttl in zip(sources, titles):
+                if _queue and _queue[-1] == src:
+                    continue
+                _queue.append(src)
+                _queue_titles.append(ttl)
+            if _queue_title and "רצועות" not in str(_queue_title) and len(_queue) > 1:
+                _queue_title = f"{_queue_title} · {len(_queue)} רצועות"
+            added_at = len(_queue) - 1
+
+    if start_now:
+        return play_list(sources, title=title)
+
+    _prefetch_around()
+    out = get_status()
+    out["ok"] = True
+    out["added"] = len(sources)
+    out["queue_index_added"] = added_at
+    return out
+
+
 def pause() -> dict[str, Any]:
     with _lock:
         proc = _proc

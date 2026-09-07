@@ -98,7 +98,10 @@ const STRINGS = {
   prevFailed: "מעבר לקודם נכשל",
   playlistPos: (cur, total) => `רצועה ${cur} מתוך ${total}`,
   queueHint: "לחץ לרשימה — אפשר לקפוץ לשיר",
-  playFromHere: "נגן מכאן",
+  addToQueue: "הוסף לתור",
+  queued: (t) => t ? `נוסף לתור: ${t}` : "נוסף לתור",
+  queueFailed: "הוספה לתור נכשלה",
+  saveToLibrary: "שמור לספרייה",
   working: "עובד…",
   busyTimeout: "הפעולה ארכה מדי — מסתיר את המסך. אפשר לרענן אם משהו נתקע",
   requestTimeout: "השרת לא ענה בזמן",
@@ -186,6 +189,7 @@ const els = {
   adminDevicesGroup: $("#adminDevicesGroup"),
   authWhoami: $("#authWhoami"),
   saveUrlBtn: $("#saveUrlBtn"),
+  queueUrlBtn: $("#queueUrlBtn"),
   sourceTabs: $("#sourceTabs"),
   uploadBtn: $("#uploadBtn"),
   uploadFile: $("#uploadFile"),
@@ -1305,21 +1309,94 @@ function renderSearchResults(results) {
   for (const r of results) {
     const title = r.title || r.name || r.url || "—";
     const url = r.url || r.link || "";
-    const row = document.createElement("button");
-    row.type = "button";
+    const row = document.createElement("div");
     row.className = "search-result";
-    row.innerHTML = `
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "search-play";
+    play.innerHTML = `
       <div class="cell-title">${escapeHtml(title)}</div>
       ${r.channel || r.uploader ? `<div class="cell-sub">${escapeHtml(r.channel || r.uploader)}</div>` : ""}
     `;
-    row.addEventListener("click", () => {
+    play.addEventListener("click", () => {
       if (!url) return;
       els.ytUrl.value = url;
       localStorage.setItem(LS_URL, url);
       playUrl(url, title);
     });
+    const actions = document.createElement("div");
+    actions.className = "search-actions";
+    const qBtn = miniIconBtn("queue", STRINGS.addToQueue, () => enqueueUrl(url, title, false));
+    const sBtn = miniIconBtn("save", STRINGS.saveToLibrary, () => saveUrl(url));
+    actions.appendChild(qBtn);
+    actions.appendChild(sBtn);
+    row.appendChild(play);
+    row.appendChild(actions);
     box.appendChild(row);
   }
+}
+
+function miniIconBtn(kind, label, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "icon-mini";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = kind === "save" ? ICON_SAVE : ICON_QUEUE;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    onClick();
+  });
+  return btn;
+}
+
+const ICON_QUEUE = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3V6zm0 5h12v2H3v-2zm0 5h12v2H3v-2zm14-1.5v3h3v2h-3v3h-2v-3h-3v-2h3v-3h2z"/></svg>`;
+const ICON_SAVE = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v16l7-3 7 3V5a2 2 0 0 0-2-2zm0 15.76-5-2.15-5 2.15V5h10v13.76z"/></svg>`;
+
+async function enqueueUrl(url, title, expand) {
+  if (!url) {
+    toast(STRINGS.pasteUrlFirst);
+    return;
+  }
+  if (!hasSpeaker) {
+    toast(STRINGS.noBtSpeaker);
+    return;
+  }
+  const data = await api("/api/queue", {
+    method: "POST",
+    body: JSON.stringify({ url, title, expand: expand !== false }),
+    timeoutMs: expand === false ? 20000 : 90000,
+  });
+  if (!data.ok) {
+    if (looksLikeNoSpeakerError(data.error)) toast(STRINGS.noBtSpeaker);
+    else toast(data.error || STRINGS.queueFailed);
+    return;
+  }
+  toast(STRINGS.queued(title || data.title));
+  queueOpen = true;
+  await refreshStatus();
+}
+
+async function enqueueFile(fileId, title) {
+  if (!hasSpeaker) {
+    toast(STRINGS.noBtSpeaker);
+    return;
+  }
+  const data = await api("/api/queue", {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId, title }),
+  });
+  if (!data.ok) {
+    toast(data.error || STRINGS.queueFailed);
+    return;
+  }
+  toast(STRINGS.queued(title));
+  queueOpen = true;
+  await refreshStatus();
+}
+
+async function queueCurrentUrl() {
+  await enqueueUrl(els.ytUrl.value.trim(), null, true);
 }
 
 async function searchYoutube() {
@@ -1428,6 +1505,15 @@ function renderLibrary(files) {
       <div class="cell-actions-inline"></div>`;
     cell.querySelector(".file-row").addEventListener("click", () => playFile(f.id, f.title || f.name));
     const actions = cell.querySelector(".cell-actions-inline");
+    const queue = document.createElement("button");
+    queue.type = "button";
+    queue.className = "text-btn";
+    queue.textContent = "תור";
+    queue.title = STRINGS.addToQueue;
+    queue.addEventListener("click", (e) => {
+      e.stopPropagation();
+      enqueueFile(f.id, f.title || f.name);
+    });
     const add = document.createElement("button");
     add.type = "button";
     add.className = "text-btn";
@@ -1445,6 +1531,7 @@ function renderLibrary(files) {
       e.stopPropagation();
       deleteLibraryFile(f.id, f.title || f.name);
     });
+    actions.appendChild(queue);
     actions.appendChild(add);
     actions.appendChild(del);
     group.appendChild(cell);
@@ -1542,15 +1629,15 @@ function scheduleSavePoll() {
   }, 2500);
 }
 
-async function saveCurrentUrl() {
-  const url = (els.ytUrl.value || "").trim();
-  if (!url) {
+async function saveUrl(url) {
+  const href = (url || "").trim();
+  if (!href) {
     toast(STRINGS.pasteUrlToSave);
     return;
   }
   const data = await api("/api/library/save-url", {
     method: "POST",
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url: href }),
   });
   if (!data.ok) {
     toast(data.error || STRINGS.saveFailed);
@@ -1558,6 +1645,10 @@ async function saveCurrentUrl() {
   }
   toast(STRINGS.saveStarted);
   scheduleSavePoll();
+}
+
+async function saveCurrentUrl() {
+  await saveUrl(els.ytUrl.value || "");
 }
 
 async function refreshPlaylists() {
@@ -1962,6 +2053,7 @@ function bind() {
   });
   els.scanBtn.addEventListener("click", scan);
   els.playBtn.addEventListener("click", play);
+  els.queueUrlBtn.addEventListener("click", queueCurrentUrl);
   els.playPauseBtn.addEventListener("click", transportClick(togglePlayPause));
   els.stopBtn.addEventListener("click", transportClick(stop));
   els.prevBtn.addEventListener("click", transportClick(prevTrack));

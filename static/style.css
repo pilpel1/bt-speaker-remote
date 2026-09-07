@@ -545,14 +545,10 @@ body {
 }
 
 .search-result {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
   width: 100%;
-  border: 0;
-  background: transparent;
-  text-align: start;
-  padding: 12px 16px;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
   border-top: 1px solid var(--sep);
 }
 
@@ -560,12 +556,54 @@ body {
   border-top: 0;
 }
 
-.search-result:active {
+.search-play {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  text-align: start;
+  padding: 12px 8px 12px 16px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.search-play:active {
   background: var(--fill);
 }
 
 .search-result .cell-title {
   white-space: normal;
+}
+
+.search-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  padding-inline-end: 8px;
+  gap: 2px;
+}
+
+.icon-mini {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.icon-mini:active {
+  background: var(--fill);
+}
+
+.icon-mini svg {
+  width: 20px;
+  height: 20px;
 }
 
 /* iOS switch — keep LTR so knob direction is correct */

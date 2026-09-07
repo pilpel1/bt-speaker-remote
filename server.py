@@ -423,6 +423,37 @@ def play():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/queue")
+@require_token
+def enqueue():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or data.get("link") or "").strip()
+    file_id = (data.get("file_id") or "").strip()
+    title = (data.get("title") or "").strip() or None
+    expand = True if data.get("expand") is None else bool(data.get("expand"))
+    if not url and not file_id:
+        return jsonify({"ok": False, "error": "Missing url or file_id"}), 400
+    try:
+        err, code = _ensure_speaker_ready()
+        if err is not None:
+            return err, code
+        if file_id:
+            item = library.resolve(file_id)
+            if not item:
+                return jsonify({"ok": False, "error": "File not found"}), 404
+            result = player.enqueue(
+                [str(item["path"])],
+                title=item.get("title") or title,
+                expand=False,
+            )
+        else:
+            result = player.enqueue([url], title=title, expand=expand)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/api/play/playlist")
 @require_token
 def play_playlist():
