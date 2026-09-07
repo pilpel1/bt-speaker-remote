@@ -1,5 +1,5 @@
 /* Minimal service worker — enables installability where secure context allows. */
-const CACHE = "bt-speaker-shell-v7";
+const CACHE = "bt-speaker-shell-v8";
 const PRECACHE = [
   "/",
   "/static/style.css",

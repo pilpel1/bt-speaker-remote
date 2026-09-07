@@ -524,7 +524,7 @@ def search_youtube(query: str, limit: int = 10) -> dict[str, Any]:
                 "yt-dlp",
                 "--flat-playlist",
                 "--print",
-                "%(id)s|||%(title)s|||%(webpage_url)s|||%(duration)s",
+                "%(id)s|||%(title)s|||%(webpage_url)s|||%(duration)s|||%(channel)s|||%(uploader)s|||%(thumbnail)s",
                 f"ytsearch{limit_i}:{query}",
             ],
             timeout=60,
@@ -552,17 +552,34 @@ def search_youtube(query: str, limit: int = 10) -> dict[str, Any]:
                         duration = float(raw_dur)
                     except ValueError:
                         duration = None
+            channel = ""
+            if len(parts) > 4:
+                channel = parts[4].strip()
+            if (not channel or channel.upper() == "NA") and len(parts) > 5:
+                channel = parts[5].strip()
+            if channel.upper() == "NA":
+                channel = ""
+            thumb = ""
+            if len(parts) > 6:
+                thumb = parts[6].strip()
+                if thumb.upper() in ("NA", "NONE", "NULL"):
+                    thumb = ""
             if not url or url.upper() == "NA":
                 if vid_id and vid_id.upper() != "NA":
                     url = f"https://www.youtube.com/watch?v={vid_id}"
                 else:
                     continue
+            if not thumb and vid_id and vid_id.upper() != "NA":
+                thumb = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
             results.append(
                 {
                     "id": vid_id if vid_id.upper() != "NA" else None,
                     "title": title if title.upper() != "NA" else url,
                     "url": url,
                     "duration": duration,
+                    "channel": channel or None,
+                    "uploader": channel or None,
+                    "thumbnail": thumb or None,
                 }
             )
         return {

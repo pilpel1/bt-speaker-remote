@@ -1309,14 +1309,28 @@ function renderSearchResults(results) {
   for (const r of results) {
     const title = r.title || r.name || r.url || "—";
     const url = r.url || r.link || "";
+    const channel = r.channel || r.uploader || "";
+    const dur = Number(r.duration);
+    const durLabel = Number.isFinite(dur) && dur > 0 ? fmtTime(dur) : "";
+    const thumb = r.thumbnail || (r.id ? `https://i.ytimg.com/vi/${encodeURIComponent(r.id)}/mqdefault.jpg` : "");
+    const metaParts = [channel, durLabel].filter(Boolean);
+    const thumbHtml = thumb
+      ? `<span class="search-thumb-wrap">
+          <img class="search-thumb" src="${escapeHtml(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" />
+          ${durLabel ? `<span class="search-dur">${escapeHtml(durLabel)}</span>` : ""}
+        </span>`
+      : "";
     const row = document.createElement("div");
     row.className = "search-result";
     const play = document.createElement("button");
     play.type = "button";
     play.className = "search-play";
     play.innerHTML = `
-      <div class="cell-title">${escapeHtml(title)}</div>
-      ${r.channel || r.uploader ? `<div class="cell-sub">${escapeHtml(r.channel || r.uploader)}</div>` : ""}
+      ${thumbHtml}
+      <div class="search-meta">
+        <div class="cell-title">${escapeHtml(title)}</div>
+        ${metaParts.length ? `<div class="cell-sub">${escapeHtml(metaParts.join(" · "))}</div>` : ""}
+      </div>
     `;
     play.addEventListener("click", () => {
       if (!url) return;
