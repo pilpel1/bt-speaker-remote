@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,14 +23,15 @@ _queue_titles: list[str] = []
 _queue_index: int = 0
 _queue_title: str | None = None
 _current_file: Path | None = None
-_prefetch: dict[str, Any] = {
-    "gen": 0,
-    "status": "idle",
-    "index": None,
-    "url": None,
-    "path": None,
-    "error": None,
-}
+# Bumped on every play/skip/stop. Stale download threads must not start mpv.
+_play_gen: int = 0
+# url -> {stem, proc, path, complete, error, at}
+_jobs: dict[str, dict[str, Any]] = {}
+KEEP_SEC = 20 * 60
+START_BYTES = 384 * 1024
+PREFETCH_AHEAD = 2
+MAX_PARALLEL_DL = 3
+_STREAM_EXT = {".webm", ".ogg", ".opus", ".mp3", ".mkv", ".ts", ".mpeg", ".flac"}
 _err_lock = threading.Lock()
 _err_buf: list[str] = []
 _state: dict[str, Any] = {
@@ -61,7 +63,12 @@ YTDLP_PREFIX = [
     "--retries",
     "8",
 ]
-YTDLP_FORMAT = "best[protocol=m3u8_native][height<=480]/bestaudio/best/18"
+# Prefer webm/opus so we can start mpv before the file is complete (m4a often
+# has the moov atom at the end → unplayable until the download finishes).
+YTDLP_FORMAT = (
+    "bestaudio[ext=webm]/bestaudio[acodec=opus]/"
+    "best[protocol=m3u8_native][height<=480]/bestaudio/best/18"
+)
 
 
 def _run(args: list[str], timeout: float = 30) -> subprocess.CompletedProcess[str]:
@@ -102,7 +109,7 @@ def _yt_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
-def _expand_yt_playlist(url: str, limit: int = 40) -> tuple[list[tuple[str, str]], str]:
+def _expand_yt_playlist(url: str, limit: int = 80) -> tuple[list[tuple[str, str]], str]:
     """Return ([(watch_url, title), ...], playlist_title)."""
     try:
         r = _run(
@@ -236,49 +243,97 @@ def _friendly_error(raw: str) -> str:
 
 
 def _cleanup_play_files() -> None:
-    try:
-        if PLAY_DIR.is_dir():
-            for p in PLAY_DIR.iterdir():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    _sweep_jobs(drop_all=True)
+
+
+def _kill_proc(proc: subprocess.Popen[Any] | None) -> None:
+    if proc and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+
+def _kill_all_jobs() -> None:
+    global _ytdl_proc, _prefetch_proc
+    with _lock:
+        procs = [j.get("proc") for j in _jobs.values() if j.get("proc")]
+        for job in _jobs.values():
+            job["proc"] = None
+        _ytdl_proc = None
+        _prefetch_proc = None
+    for proc in procs:
+        _kill_proc(proc)
 
 
 def _kill_ytdl() -> None:
-    global _ytdl_proc
-    proc = _ytdl_proc
-    _ytdl_proc = None
-    if proc and proc.poll() is None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=1)
-        except Exception:
-            pass
+    _kill_all_jobs()
 
 
 def _kill_prefetch() -> None:
-    global _prefetch_proc
+    _kill_all_jobs()
+
+
+def _gen_ok(gen: int | None, *, locked: bool = False) -> bool:
+    if gen is None:
+        return True
+    if locked:
+        return gen == _play_gen
     with _lock:
-        _prefetch["gen"] = int(_prefetch.get("gen") or 0) + 1
-        _prefetch.update(
-            status="idle", index=None, url=None, path=None, error=None
-        )
-    proc = _prefetch_proc
-    _prefetch_proc = None
-    if proc and proc.poll() is None:
+        return gen == _play_gen
+
+
+def _bump_gen() -> int:
+    global _play_gen
+    with _lock:
+        _play_gen += 1
+        return _play_gen
+
+
+def _superseded(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    out = {"ok": False, "superseded": True, "error": "superseded"}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _kill_orphaned_mpv(keep: subprocess.Popen[Any] | None = None) -> None:
+    """Kill leftover mpv processes from overlapping skip/play requests."""
+    keep_pid = keep.pid if keep is not None else None
+    try:
+        r = _run(["pgrep", "-f", "bt-speaker-remote-mpv.sock"], timeout=3)
+    except Exception:
+        return
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.isdigit():
+            continue
+        pid = int(line)
+        if keep_pid is not None and pid == keep_pid:
+            continue
         try:
-            proc.kill()
-        except Exception:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
             pass
+    time.sleep(0.05)
+    try:
+        r = _run(["pgrep", "-f", "bt-speaker-remote-mpv.sock"], timeout=3)
+    except Exception:
+        return
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.isdigit():
+            continue
+        pid = int(line)
+        if keep_pid is not None and pid == keep_pid:
+            continue
         try:
-            proc.wait(timeout=1)
-        except Exception:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
             pass
 
 
@@ -570,9 +625,11 @@ def _with_status(ok: bool, error: str | None = None, **extra: Any) -> dict[str, 
 
 
 def _watch_proc(proc: subprocess.Popen[Any], url: str) -> None:
-    global _proc
+    global _proc, _play_gen
     proc.wait()
     next_index: int | None = None
+    next_gen: int | None = None
+    resume_at = 0.0
     with _lock:
         if _proc is not proc:
             return
@@ -583,10 +640,21 @@ def _watch_proc(proc: subprocess.Popen[Any], url: str) -> None:
         qlen = len(_queue)
         qidx = _queue_index
         rc = proc.returncode
+        still_dl = _job_still_downloading(url)
         # Advance only on clean EOF. Do NOT treat leftover yt-dlp stderr
         # (403 retries that later succeeded) as a failure — that was stopping mixes.
-        if rc == 0 and qlen > 1 and qidx + 1 < qlen:
+        if rc == 0 and still_dl:
+            # Growing-file EOF: replay same track from last position.
+            next_index = qidx
+            resume_at = float(_state.get("time_pos") or 0)
+            _play_gen += 1
+            next_gen = _play_gen
+            _state["loading"] = True
+            _state["playing"] = True
+        elif rc == 0 and qlen > 1 and qidx + 1 < qlen:
             next_index = qidx + 1
+            _play_gen += 1
+            next_gen = _play_gen
             _state["loading"] = True
             _state["playing"] = True
         elif rc not in (0, None, -signal.SIGTERM, -15, -signal.SIGINT, -2):
@@ -595,7 +663,9 @@ def _watch_proc(proc: subprocess.Popen[Any], url: str) -> None:
     _cleanup_ipc()
     if next_index is not None:
         try:
-            _play_from_index(next_index, wait_for_mpv=False)
+            _play_from_index(
+                next_index, wait_for_mpv=False, gen=next_gen, resume_at=resume_at
+            )
         except Exception as e:
             with _lock:
                 _state["playing"] = False
@@ -604,8 +674,9 @@ def _watch_proc(proc: subprocess.Popen[Any], url: str) -> None:
 
 
 def stop() -> dict[str, Any]:
-    global _proc, _queue, _queue_titles, _queue_index, _queue_title, _current_file
+    global _proc, _queue, _queue_titles, _queue_index, _queue_title, _current_file, _play_gen
     with _lock:
+        _play_gen += 1
         proc = _proc
         _proc = None
         _queue = []
@@ -636,10 +707,10 @@ def stop() -> dict[str, Any]:
                 proc.kill()
             except Exception:
                 pass
-    _kill_prefetch()
-    _kill_ytdl()
+    _kill_all_jobs()
     _cleanup_ipc()
-    _cleanup_play_files()
+    _kill_orphaned_mpv()
+    _sweep_jobs(drop_all=False)
     _current_file = None
     return _with_status(True)
 
@@ -704,21 +775,167 @@ def _unlink_quiet(path: Path | None) -> None:
         pass
 
 
-def _download_youtube_to(
-    url: str, stem: str, *, prefetch: bool = False
-) -> tuple[Path | None, str | None]:
-    """Download with yt-dlp to PLAY_DIR/stem.ext. Does not wipe other queue files."""
-    global _ytdl_proc, _prefetch_proc
+def _url_stem(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _job_file(stem: str) -> Path | None:
+    if not stem or not PLAY_DIR.is_dir():
+        return None
+    files = [
+        p
+        for p in PLAY_DIR.glob(f"{stem}.*")
+        if p.is_file() and not p.name.endswith(".part")
+    ]
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    return files[0]
+
+
+def _path_size(path: Path | None) -> int:
+    if not path:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _ext_streamable(path: Path | None) -> bool:
+    return bool(path and path.suffix.lower() in _STREAM_EXT)
+
+
+def _job_still_downloading(url: str) -> bool:
+    with _lock:
+        job = _jobs.get(url) or {}
+        if job.get("complete"):
+            return False
+        proc = job.get("proc")
+        return bool(proc and proc.poll() is None)
+
+
+def _keep_urls() -> set[str]:
+    keep: set[str] = set()
+    qidx = _queue_index
+    for i, u in enumerate(_queue):
+        if abs(i - qidx) <= PREFETCH_AHEAD + 1:
+            keep.add(u)
+    playing = _state.get("url")
+    if playing:
+        keep.add(str(playing))
+    return keep
+
+
+def _running_dl_count() -> int:
+    n = 0
+    for job in _jobs.values():
+        proc = job.get("proc")
+        if proc is not None and proc.poll() is None:
+            n += 1
+    return n
+
+
+def _sweep_jobs(*, drop_all: bool = False) -> None:
+    now = time.time()
+    with _lock:
+        keep = set() if drop_all else _keep_urls()
+        items = list(_jobs.items())
+    for url, job in items:
+        stem = str(job.get("stem") or "")
+        path = job.get("path") if isinstance(job.get("path"), Path) else _job_file(stem)
+        at = float(job.get("at") or 0)
+        proc = job.get("proc")
+        live = bool(proc and proc.poll() is None)
+        stale = drop_all or (url not in keep and now - at > KEEP_SEC)
+        if stale and live:
+            _kill_proc(proc)
+            live = False
+        if stale and not live:
+            _unlink_quiet(path if isinstance(path, Path) else None)
+            with _lock:
+                _jobs.pop(url, None)
+    if not PLAY_DIR.is_dir():
+        return
+    keep_stems = set()
+    with _lock:
+        keep_stems = {str(j.get("stem") or "") for j in _jobs.values()}
+        if not drop_all:
+            for u in _keep_urls():
+                keep_stems.add(_url_stem(u))
+    for p in list(PLAY_DIR.iterdir()):
+        try:
+            if p.stem in keep_stems and not drop_all:
+                continue
+            if drop_all or now - p.stat().st_mtime > KEEP_SEC:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def _mark_job_done(url: str, ytdl: subprocess.Popen[Any], rc: int | None, err: str) -> None:
+    stem = _url_stem(url)
+    path = _job_file(stem)
+    with _lock:
+        job = _jobs.get(url)
+        if not job:
+            return
+        if job.get("proc") is ytdl:
+            job["proc"] = None
+        job["path"] = path
+        job["at"] = time.time()
+        if rc == 0 and path:
+            job["complete"] = True
+            job["error"] = None
+        elif not job.get("complete"):
+            job["error"] = err or "הורדה מיוטיוב נכשלה"
+
+
+def _start_job(url: str) -> dict[str, Any]:
+    """Start or reuse a yt-dlp job for this URL. Never kills a useful cache file."""
     try:
         PLAY_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return None, f"Cannot create play dir: {e}"
-    for old in PLAY_DIR.glob(f"{stem}.*"):
-        _unlink_quiet(old)
+        return {"error": f"Cannot create play dir: {e}"}
+    stem = _url_stem(url)
+    with _lock:
+        job = _jobs.get(url)
+        if job:
+            proc = job.get("proc")
+            path = job.get("path") if isinstance(job.get("path"), Path) else _job_file(stem)
+            if path:
+                job["path"] = path
+            if job.get("complete") and path and _path_size(path) > 0:
+                return job
+            if proc is not None and proc.poll() is None:
+                return job
+            if path and _path_size(path) > 0 and job.get("complete"):
+                return job
+        if _running_dl_count() >= MAX_PARALLEL_DL and not (job and job.get("proc")):
+            return job or {"stem": stem, "waiting": True}
+        job = {
+            "stem": stem,
+            "proc": None,
+            "path": _job_file(stem),
+            "complete": False,
+            "error": None,
+            "at": time.time(),
+        }
+        _jobs[url] = job
+
+    existing = _job_file(stem)
+    if existing and _path_size(existing) > 0:
+        with _lock:
+            job["path"] = existing
+            job["at"] = time.time()
+            _jobs[url] = job
+
     cmd = [
         *YTDLP_PREFIX,
         "--no-playlist",
         "--no-progress",
+        "--no-part",
+        "--continue",
         "-f",
         YTDLP_FORMAT,
         "-o",
@@ -731,10 +948,6 @@ def _download_youtube_to(
         stderr=subprocess.PIPE,
         env=_child_env(),
     )
-    if prefetch:
-        _prefetch_proc = ytdl
-    else:
-        _ytdl_proc = ytdl
     local_err: list[str] = []
 
     def _drain_ytdl() -> None:
@@ -745,110 +958,106 @@ def _download_youtube_to(
                     break
                 text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
                 local_err.append(text)
-                if not prefetch:
-                    _err_add(text)
+                _err_add(text)
         except Exception:
             pass
 
     if ytdl.stderr:
         threading.Thread(target=_drain_ytdl, daemon=True).start()
-    try:
-        rc = ytdl.wait(timeout=120)
-    except subprocess.TimeoutExpired:
-        if prefetch:
-            _kill_prefetch()
-        else:
-            _kill_ytdl()
-        return None, "הורדת יוטיוב לקחה יותר מדי זמן"
-    finally:
-        if prefetch:
-            if _prefetch_proc is ytdl:
-                _prefetch_proc = None
-        elif _ytdl_proc is ytdl:
-            _ytdl_proc = None
 
-    files = [
-        p
-        for p in PLAY_DIR.glob(f"{stem}.*")
-        if p.is_file() and not p.name.endswith(".part")
-    ]
-    if rc != 0 or not files:
-        return None, _friendly_error("".join(local_err) or _err_text()) or "הורדה מיוטיוב נכשלה"
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0], None
-
-
-def _prefetch_worker(index: int, url: str, gen: int) -> None:
-    path, err = _download_youtube_to(url, f"n{index}", prefetch=True)
     with _lock:
-        if gen != _prefetch.get("gen"):
-            _unlink_quiet(path)
-            return
-        if path:
-            _prefetch.update(status="ready", path=path, error=None, index=index, url=url)
-        else:
-            _prefetch.update(status="error", path=None, error=err, index=index, url=url)
+        job = _jobs.get(url) or job
+        job["proc"] = ytdl
+        job["at"] = time.time()
+        _jobs[url] = job
 
-
-def _start_prefetch(index: int) -> None:
-    with _lock:
-        if index < 0 or index >= len(_queue):
-            return
-        url = _queue[index]
-        if _prefetch.get("status") in ("ready", "running") and _prefetch.get("index") == index:
-            return
-        _prefetch["gen"] = int(_prefetch.get("gen") or 0) + 1
-        gen = _prefetch["gen"]
-        _prefetch.update(status="running", index=index, url=url, path=None, error=None)
-    old = _prefetch_proc
-    # drop previous prefetch download so it doesn't fight the new one
-    if old and old.poll() is None:
+    def _reap() -> None:
         try:
-            old.kill()
-        except Exception:
-            pass
-    if _is_youtube(url):
-        threading.Thread(
-            target=_prefetch_worker, args=(index, url, gen), daemon=True
-        ).start()
-        return
-    p = Path(url)
-    with _lock:
-        if gen != _prefetch.get("gen"):
-            return
-        _prefetch.update(
-            status="ready" if p.is_file() else "idle",
-            path=p if p.is_file() else None,
-            index=index,
-            url=url,
-            error=None,
-        )
+            rc = ytdl.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            _kill_proc(ytdl)
+            rc = ytdl.poll()
+        _mark_job_done(url, ytdl, rc, "".join(local_err))
+        _prefetch_around()
+
+    threading.Thread(target=_reap, daemon=True).start()
+    return job
 
 
-def _take_prefetched(index: int, url: str) -> tuple[Path | None, str | None]:
+def _file_playable(path: Path | None, complete: bool) -> bool:
+    if not path or _path_size(path) <= 0:
+        return False
+    if complete:
+        return True
+    if _ext_streamable(path) and _path_size(path) >= START_BYTES:
+        return True
+    return False
+
+
+def _ensure_youtube(url: str, gen: int | None = None) -> tuple[Path | None, str | None]:
+    """Return a path as soon as mpv can start (partial webm, or full m4a)."""
+    job = _start_job(url)
+    if job.get("error") and not job.get("path"):
+        return None, str(job.get("error"))
     deadline = time.time() + 120
     while time.time() < deadline:
+        if gen is not None and not _gen_ok(gen):
+            return None, "superseded"
         with _lock:
-            st = {
-                "status": _prefetch.get("status"),
-                "index": _prefetch.get("index"),
-                "url": _prefetch.get("url"),
-                "path": _prefetch.get("path"),
-                "error": _prefetch.get("error"),
-            }
-        if st["index"] != index or st["url"] != url:
-            break
-        if st["status"] == "ready" and st["path"]:
+            job = _jobs.get(url) or {}
+            proc = job.get("proc")
+            complete = bool(job.get("complete"))
+            err = job.get("error")
+            stem = str(job.get("stem") or _url_stem(url))
+        path = job.get("path") if isinstance(job.get("path"), Path) else _job_file(stem)
+        if path:
             with _lock:
-                _prefetch.update(status="idle", path=None)
-            return Path(st["path"]), None
-        if st["status"] == "error":
-            return None, st["error"] or "הורדה מיוטיוב נכשלה"
-        if st["status"] != "running":
-            break
+                if url in _jobs:
+                    _jobs[url]["path"] = path
+                    _jobs[url]["at"] = time.time()
+        if _file_playable(path, complete):
+            return path, None
+        live = bool(proc and proc.poll() is None)
+        if not live and not complete:
+            if _file_playable(path, True) or _file_playable(path, False):
+                return path, None
+            if err:
+                return None, str(err)
+            # Slot was full — retry start.
+            _start_job(url)
         time.sleep(0.2)
+    path = _job_file(_url_stem(url))
+    if _file_playable(path, True) or _file_playable(path, False):
+        return path, None
+    return None, "הורדת יוטיוב לקחה יותר מדי זמן"
+
+
+def _prefetch_around(index: int | None = None) -> None:
+    with _lock:
+        qidx = _queue_index if index is None else index
+        urls: list[str] = []
+        for i in range(qidx + 1, min(len(_queue), qidx + 1 + PREFETCH_AHEAD)):
+            urls.append(_queue[i])
+        # Keep previous track warm for skip-back.
+        if qidx > 0:
+            urls.append(_queue[qidx - 1])
+    for u in urls:
+        if not _is_youtube(u):
+            continue
+        with _lock:
+            job = _jobs.get(u) or {}
+            proc = job.get("proc")
+            if job.get("complete") or (proc is not None and proc.poll() is None):
+                continue
+            if _running_dl_count() >= MAX_PARALLEL_DL:
+                break
+        _start_job(u)
+    _sweep_jobs(drop_all=False)
+
+
+def _take_prefetched(index: int, url: str, gen: int | None = None) -> tuple[Path | None, str | None]:
     if _is_youtube(url):
-        return _download_youtube_to(url, f"c{index}", prefetch=False)
+        return _ensure_youtube(url, gen=gen)
     p = Path(url)
     if p.is_file():
         return p, None
@@ -884,20 +1093,30 @@ def _track_display(index: int, url: str) -> str:
     return (_queue_title or _state.get("title") or url)[:200]
 
 
-def _play_from_index(index: int, *, wait_for_mpv: bool) -> dict[str, Any]:
+def _play_from_index(
+    index: int, *, wait_for_mpv: bool, gen: int | None = None, resume_at: float = 0.0
+) -> dict[str, Any]:
     """Play queue[index], skipping tracks that fail before mpv starts."""
     last: dict[str, Any] = {"ok": False, "error": "End of playlist"}
     i = index
     while True:
+        if gen is not None and not _gen_ok(gen):
+            return _superseded()
         with _lock:
             qlen = len(_queue)
         if i < 0 or i >= qlen:
             with _lock:
+                if gen is not None and not _gen_ok(gen, locked=True):
+                    return _superseded()
                 _state["loading"] = False
                 if not _state.get("error"):
                     _state["error"] = last.get("error") or "נגמר התור"
             return last
-        last = _play_queue_index(i, wait_for_mpv=wait_for_mpv)
+        last = _play_queue_index(
+            i, wait_for_mpv=wait_for_mpv, gen=gen, resume_at=resume_at if i == index else 0.0
+        )
+        if last.get("superseded"):
+            return last
         if last.get("ok") or last.get("started"):
             return last
         with _lock:
@@ -906,14 +1125,19 @@ def _play_from_index(index: int, *, wait_for_mpv: bool) -> dict[str, Any]:
         i += 1
 
 
-def _play_queue_index(index: int, *, wait_for_mpv: bool = True) -> dict[str, Any]:
+def _play_queue_index(
+    index: int, *, wait_for_mpv: bool = True, gen: int | None = None, resume_at: float = 0.0
+) -> dict[str, Any]:
     global _proc, _queue_index, _current_file
     with _lock:
+        if gen is None:
+            gen = _play_gen
+        elif gen != _play_gen:
+            return _superseded()
         if index < 0 or index >= len(_queue):
             return {"ok": False, "error": "End of playlist"}
         url = _queue[index]
         display = _track_display(index, url)
-        old_file = _current_file
         _state.update(
             {
                 "loading": True,
@@ -926,15 +1150,24 @@ def _play_queue_index(index: int, *, wait_for_mpv: bool = True) -> dict[str, Any
         )
 
     _stop_mpv_only()
+    _kill_orphaned_mpv()
     _err_clear()
+    if not _gen_ok(gen):
+        return _superseded()
     sink = ensure_bt_sink_default()
+    if not _gen_ok(gen):
+        return _superseded()
 
     path: Path | None = None
     mpv_src: str
     if _is_youtube(url):
-        path, dl_err = _take_prefetched(index, url)
+        path, dl_err = _take_prefetched(index, url, gen=gen)
+        if not _gen_ok(gen) or dl_err == "superseded":
+            return _superseded()
         if dl_err or path is None:
             with _lock:
+                if not _gen_ok(gen, locked=True):
+                    return _superseded()
                 _state["loading"] = False
                 _state["playing"] = False
                 _state["error"] = dl_err or "הורדה מיוטיוב נכשלה"
@@ -952,51 +1185,84 @@ def _play_queue_index(index: int, *, wait_for_mpv: bool = True) -> dict[str, Any
         mpv_src = url
 
     with _lock:
+        if not _gen_ok(gen, locked=True):
+            return _superseded()
         if index >= len(_queue) or _queue[index] != url:
             _state["loading"] = False
             _state["playing"] = False
             return {"ok": False, "error": "Queue changed"}
+
+    _stop_mpv_only()
+    _kill_orphaned_mpv()
+    if not _gen_ok(gen):
+        return _superseded()
 
     try:
         IPC_PATH.parent.mkdir(parents=True, exist_ok=True)
         proc = _start_mpv_sources([mpv_src], display)
     except FileNotFoundError:
         with _lock:
-            _state["loading"] = False
-            _state["playing"] = False
+            if _gen_ok(gen, locked=True):
+                _state["loading"] = False
+                _state["playing"] = False
         return {"ok": False, "error": "mpv is not installed"}
 
+    claimed = False
     with _lock:
-        _proc = proc
-        _queue_index = index
-        _current_file = path
-        _state.update(
-            {
-                "playing": True,
-                "paused": False,
-                "loading": False,
-                "url": url,
-                "title": display,
-                "started_at": time.time(),
-                "error": None,
-                "sink": sink,
-            }
-        )
+        if _gen_ok(gen, locked=True):
+            _proc = proc
+            _queue_index = index
+            _current_file = path
+            _state.update(
+                {
+                    "playing": True,
+                    "paused": False,
+                    "loading": False,
+                    "url": url,
+                    "title": display,
+                    "started_at": time.time(),
+                    "error": None,
+                    "sink": sink,
+                }
+            )
+            claimed = True
 
-    if old_file and old_file != path:
-        _unlink_quiet(old_file)
+    if not claimed:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+        _cleanup_ipc()
+        return _superseded()
+
+    _kill_orphaned_mpv(keep=proc)
 
     threading.Thread(target=_watch_proc, args=(proc, url), daemon=True).start()
-    _start_prefetch(index + 1)
+    if _gen_ok(gen):
+        _prefetch_around(index)
 
     if wait_for_mpv:
         err = _wait_until_playing(proc, timeout=12.0)
+        if not _gen_ok(gen):
+            return _superseded()
         if err:
             with _lock:
+                if not _gen_ok(gen, locked=True):
+                    return _superseded()
                 _state["playing"] = False
                 _state["loading"] = False
                 _state["error"] = err
             return {"ok": False, "error": err, "title": display, "sink": sink, "started": True}
+        if resume_at and resume_at > 1.0:
+            _mpv_ipc(["seek", float(resume_at), "absolute"])
+    elif resume_at and resume_at > 1.0:
+        _wait_until_playing(proc, timeout=8.0)
+        _mpv_ipc(["seek", float(resume_at), "absolute"])
 
     return {"ok": True, "title": display, "url": url, "sink": sink, "started": True, **get_status()}
 
@@ -1013,6 +1279,8 @@ def _start_mpv_sources(sources: list[str], display: str) -> subprocess.Popen[Any
         f"--input-ipc-server={IPC_PATH}",
         f"--title=bt-speaker-remote:{display[:80]}",
         f"--force-media-title={display[:80].replace(chr(10), ' ')}",
+        "--cache=yes",
+        "--demuxer-readahead-secs=8",
         "--ytdl-format=bestaudio/best",
         *sources,
     ]
@@ -1027,19 +1295,28 @@ def _start_mpv_sources(sources: list[str], display: str) -> subprocess.Popen[Any
     return proc
 
 
-def play_list(items: list[str], title: str | None = None) -> dict[str, Any]:
+def play_list(
+    items: list[str], title: str | None = None, start_index: int = 0
+) -> dict[str, Any]:
     global _proc, _queue, _queue_titles, _queue_index, _queue_title
     raw = _normalize_sources(items)
     sources, source_titles, pl_title = _expand_sources(raw)
     if not sources:
         return {"ok": False, "error": "Missing sources"}
 
+    titles = list(source_titles)
+    while len(titles) < len(sources):
+        titles.append("")
+    for i, src in enumerate(sources):
+        if not titles[i]:
+            titles[i] = _local_title(src) if not _is_http_url(src) else ""
+
     sink = ensure_bt_sink_default()
     first = sources[0]
     display = (title or "").strip() or pl_title
     if not display:
         if len(sources) > 1:
-            display = source_titles[0] or f"מיקס · {len(sources)} רצועות"
+            display = titles[0] or f"מיקס · {len(sources)} רצועות"
         elif _is_http_url(first):
             display = resolve_title(first) or first
         else:
@@ -1060,45 +1337,20 @@ def play_list(items: list[str], title: str | None = None) -> dict[str, Any]:
     except OSError:
         pass
 
-    all_local = all(not _is_http_url(s) for s in sources)
-    if all_local:
-        try:
-            proc = _start_mpv_sources(sources, display)
-        except FileNotFoundError:
-            return {"ok": False, "error": "mpv is not installed"}
-        with _lock:
-            _proc = proc
-            _queue = []
-            _queue_titles = []
-            _queue_index = 0
-            _queue_title = None
-            _state.update(
-                {
-                    "playing": True,
-                    "paused": False,
-                    "loading": False,
-                    "url": first,
-                    "title": display,
-                    "started_at": time.time(),
-                    "error": None,
-                    "sink": sink,
-                }
-            )
-        threading.Thread(target=_watch_proc, args=(proc, first), daemon=True).start()
-        err = _wait_until_playing(proc, timeout=12.0)
-        if err:
-            with _lock:
-                _state["playing"] = False
-                _state["error"] = err
-            return {"ok": False, "error": err, "title": display, "sink": sink}
-        return {"ok": True, "title": display, "url": first, "sink": sink, **get_status()}
+    try:
+        start_i = int(start_index)
+    except (TypeError, ValueError):
+        start_i = 0
+    start_i = max(0, min(start_i, len(sources) - 1))
 
     with _lock:
         _queue = sources
-        _queue_titles = source_titles
-        _queue_index = 0
+        _queue_titles = titles
+        _queue_index = start_i
         _queue_title = display
-    return _play_from_index(0, wait_for_mpv=True)
+        gen = _play_gen
+    _prefetch_around(start_i)
+    return _play_from_index(start_i, wait_for_mpv=True, gen=gen)
 
 
 def pause() -> dict[str, Any]:
@@ -1164,48 +1416,83 @@ def seek(
     return _with_status(False, "Provide seconds or percent")
 
 
-def next_track() -> dict[str, Any]:
+def skip_tracks(delta: int | None = None, index: int | None = None) -> dict[str, Any]:
+    """Jump by delta, or to an absolute index. Does not kill cached downloads."""
+    global _play_gen, _queue_index
     with _lock:
         qlen = len(_queue)
         qidx = _queue_index
         proc = _proc
+    if index is not None:
+        try:
+            target = int(index)
+        except (TypeError, ValueError):
+            return _with_status(False, "Invalid index")
+        delta_i = target - qidx
+    else:
+        try:
+            delta_i = int(delta if delta is not None else 1)
+        except (TypeError, ValueError):
+            return _with_status(False, "Invalid delta")
+    if delta_i == 0:
+        return _with_status(True)
+
     if qlen > 1:
-        if qidx + 1 >= qlen:
+        target = qidx + delta_i
+        if target < 0:
+            return _with_status(False, "playlist-prev failed (start of playlist?)")
+        if target >= qlen:
             return _with_status(False, "playlist-next failed (end of playlist?)")
-        return _play_from_index(qidx + 1, wait_for_mpv=True)
+        with _lock:
+            _play_gen += 1
+            gen = _play_gen
+            _queue_index = target
+            url = _queue[target]
+            display = _track_display(target, url)
+            _state.update(
+                {
+                    "loading": True,
+                    "playing": True,
+                    "paused": False,
+                    "url": url,
+                    "title": display,
+                    "error": None,
+                }
+            )
+        _prefetch_around(target)
+        return _play_from_index(target, wait_for_mpv=True, gen=gen)
+
     if not proc or proc.poll() is not None:
         return _with_status(False, "Nothing playing")
-    resp = _mpv_ipc(["playlist-next", "weak"])
-    if not _mpv_ok(resp):
-        return _with_status(False, "playlist-next failed (end of playlist?)")
+    steps = abs(delta_i)
+    cmd = "playlist-next" if delta_i > 0 else "playlist-prev"
+    last_ok = False
+    for _ in range(steps):
+        resp = _mpv_ipc([cmd, "weak"])
+        last_ok = _mpv_ok(resp)
+        if not last_ok:
+            break
+    if not last_ok:
+        err = (
+            "playlist-next failed (end of playlist?)"
+            if delta_i > 0
+            else "playlist-prev failed (start of playlist?)"
+        )
+        return _with_status(False, err)
     time.sleep(0.15)
     media = _mpv_get("media-title")
     if isinstance(media, str) and media.strip():
         with _lock:
             _state["title"] = media.strip()
     return _with_status(True)
+
+
+def next_track() -> dict[str, Any]:
+    return skip_tracks(1)
 
 
 def previous_track() -> dict[str, Any]:
-    with _lock:
-        qlen = len(_queue)
-        qidx = _queue_index
-        proc = _proc
-    if qlen > 1:
-        if qidx <= 0:
-            return _with_status(False, "playlist-prev failed (start of playlist?)")
-        return _play_queue_index(qidx - 1, wait_for_mpv=True)
-    if not proc or proc.poll() is not None:
-        return _with_status(False, "Nothing playing")
-    resp = _mpv_ipc(["playlist-prev", "weak"])
-    if not _mpv_ok(resp):
-        return _with_status(False, "playlist-prev failed (start of playlist?)")
-    time.sleep(0.15)
-    media = _mpv_get("media-title")
-    if isinstance(media, str) and media.strip():
-        with _lock:
-            _state["title"] = media.strip()
-    return _with_status(True)
+    return skip_tracks(-1)
 
 
 def get_status() -> dict[str, Any]:
@@ -1238,6 +1525,31 @@ def get_status() -> dict[str, Any]:
         if our_queue:
             base["playlist_pos"] = qidx
             base["playlist_count"] = qlen
+            base["queue_title"] = _queue_title
+            qitems: list[dict[str, Any]] = []
+            for i, u in enumerate(_queue):
+                t = ""
+                if i < len(_queue_titles) and _queue_titles[i]:
+                    t = _queue_titles[i]
+                elif not _is_http_url(u):
+                    t = _local_title(u)
+                else:
+                    t = f"רצועה {i + 1}"
+                job = _jobs.get(u) or {}
+                path = job.get("path") if isinstance(job.get("path"), Path) else None
+                qitems.append(
+                    {
+                        "index": i,
+                        "title": t[:200],
+                        "current": i == qidx,
+                        "ready": bool(
+                            job.get("complete")
+                            or _file_playable(path, False)
+                            or (not _is_youtube(u) and Path(u).is_file())
+                        ),
+                    }
+                )
+            base["queue"] = qitems
 
     if not alive:
         return base
@@ -1268,6 +1580,9 @@ def get_status() -> dict[str, Any]:
     base["time_pos"] = _num(time_pos)
     base["duration"] = _num(duration)
     base["percent"] = _num(percent)
+    if base["time_pos"] is not None:
+        with _lock:
+            _state["time_pos"] = base["time_pos"]
     if not our_queue:
         try:
             base["playlist_pos"] = int(playlist_pos) if playlist_pos is not None else None

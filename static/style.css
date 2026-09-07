@@ -25,6 +25,7 @@ html, body {
   background: var(--bg);
   color: var(--text);
   min-height: 100%;
+  overscroll-behavior-y: contain;
 }
 
 body {
@@ -335,14 +336,90 @@ body {
 }
 
 .now-sub[hidden],
-.playlist-info[hidden] {
+.queue-toggle[hidden],
+.queue-list[hidden] {
   display: none !important;
 }
 
-.playlist-info {
-  margin-top: 6px;
-  font-size: 13px;
+.queue-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px auto 0;
+  padding: 6px 12px;
+  border: 0;
+  background: var(--fill);
+  border-radius: 16px;
   color: var(--secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.queue-chevron {
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  margin-top: -3px;
+}
+
+.queue-toggle.is-open .queue-chevron {
+  transform: rotate(-135deg);
+  margin-top: 3px;
+}
+
+.queue-list {
+  margin: 8px 12px 4px;
+  max-height: 280px;
+  overflow: auto;
+  text-align: start;
+  border-top: 1px solid var(--sep);
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  border-bottom: 1px solid var(--sep);
+}
+
+.queue-item.is-current {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.queue-num {
+  width: 2em;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  flex: none;
+}
+
+.queue-item.is-ready .queue-num::after {
+  content: "";
+}
+
+.queue-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  flex: none;
+  opacity: 0.7;
+}
+
+.queue-dot.is-off {
+  background: var(--sep);
 }
 
 .seek-row {
@@ -685,6 +762,23 @@ body {
   align-items: center;
   gap: 8px;
   width: 100%;
+}
+
+.pl-track-btn {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.pl-hint {
+  font-size: 12px;
+  color: var(--secondary);
+  padding: 4px 16px 10px;
 }
 
 .pl-picker {

@@ -97,6 +97,8 @@ const STRINGS = {
   nextFailed: "מעבר לבא נכשל",
   prevFailed: "מעבר לקודם נכשל",
   playlistPos: (cur, total) => `רצועה ${cur} מתוך ${total}`,
+  queueHint: "לחץ לרשימה — אפשר לקפוץ לשיר",
+  playFromHere: "נגן מכאן",
   working: "עובד…",
   busyTimeout: "הפעולה ארכה מדי — מסתיר את המסך. אפשר לרענן אם משהו נתקע",
   requestTimeout: "השרת לא ענה בזמן",
@@ -158,6 +160,8 @@ const els = {
   nowTitle: $("#nowTitle"),
   nowSub: $("#nowSub"),
   playlistInfo: $("#playlistInfo"),
+  queueToggle: $("#queueToggle"),
+  queueList: $("#queueList"),
   seekBar: $("#seekBar"),
   timeCurrent: $("#timeCurrent"),
   timeDuration: $("#timeDuration"),
@@ -234,6 +238,12 @@ let recSeconds = 0;
 let recPendingBlob = null;
 let recPendingName = "recording.webm";
 let plPickerCallback = null;
+let statusReady = false;
+let btPowerSyncing = false;
+let skipDelta = 0;
+let skipTimer = null;
+let skipFlushing = false;
+let queueOpen = false;
 
 function getToken() {
   return localStorage.getItem(LS_TOKEN) || "";
@@ -446,6 +456,60 @@ function updateSeekUI(timePos, duration, percent) {
   }
 }
 
+function renderQueue(p) {
+  const items = p.queue || [];
+  const count = p.playlist_count;
+  const pos = p.playlist_pos;
+  if (!items.length && (count == null || Number(count) < 2)) {
+    els.queueToggle.hidden = true;
+    els.queueList.hidden = true;
+    return;
+  }
+  const cur = (pos != null ? Number(pos) : 0) + 1;
+  const total = count || items.length;
+  els.playlistInfo.textContent = STRINGS.playlistPos(cur, total);
+  els.queueToggle.hidden = false;
+  els.queueToggle.classList.toggle("is-open", queueOpen);
+  els.queueToggle.title = STRINGS.queueHint;
+  els.queueList.hidden = !queueOpen;
+  if (!queueOpen) return;
+  els.queueList.innerHTML = "";
+  for (const it of items) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "queue-item" + (it.current ? " is-current" : "");
+    btn.innerHTML = `
+      <span class="queue-num">${Number(it.index) + 1}</span>
+      <span class="cell-title" style="flex:1">${escapeHtml(it.title || "")}</span>
+      <span class="queue-dot ${it.ready ? "" : "is-off"}" title="${it.ready ? "מוכן" : ""}"></span>`;
+    btn.addEventListener("click", () => skipToIndex(it.index));
+    els.queueList.appendChild(btn);
+  }
+}
+
+function toggleQueue() {
+  queueOpen = !queueOpen;
+  els.queueToggle.classList.toggle("is-open", queueOpen);
+  refreshStatus();
+}
+
+async function skipToIndex(index) {
+  setBusy(true, STRINGS.loadingTrack);
+  try {
+    const data = await api("/api/skip", {
+      method: "POST",
+      body: JSON.stringify({ index }),
+      timeoutMs: 130000,
+    });
+    if (!data.ok && !data.superseded) toast(data.error || STRINGS.nextFailed);
+    await refreshStatus();
+  } catch {
+    toast(STRINGS.nextFailed);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function schedulePoll() {
   clearInterval(statusTimer);
   pollMs = playerPlaying ? 1500 : 4000;
@@ -549,38 +613,48 @@ function renderDevices(devices) {
 function applyStatus(data) {
   if (!data) return;
   if (data.host) els.hostLabel.textContent = data.host;
+  statusReady = true;
 
   const b = data.bluetooth || {};
-  const powered = !!b.powered;
-  els.btPower.checked = powered;
-  const connected = b.connected || [];
-  hasSpeaker = Array.isArray(connected) && connected.length > 0;
-  if (!hasSpeaker && Array.isArray(b.devices)) {
-    hasSpeaker = b.devices.some((d) => d.connected);
-  }
-  if (!powered) {
-    els.btSubtitle.textContent = STRINGS.btOff;
-  } else if (connected.length) {
-    els.btSubtitle.textContent = STRINGS.btConnectedTo(
-      connected.map((c) => c.name).join(", "),
-    );
-  } else {
-    els.btSubtitle.textContent = STRINGS.btOn;
-  }
+  if (!data.light) {
+    const powered = !!b.powered;
+    btPowerSyncing = true;
+    els.btPower.checked = powered;
+    btPowerSyncing = false;
+    const connected = b.connected || [];
+    hasSpeaker = Array.isArray(connected) && connected.length > 0;
+    if (!hasSpeaker && Array.isArray(b.devices)) {
+      hasSpeaker = b.devices.some((d) => d.connected);
+    }
+    if (!powered) {
+      els.btSubtitle.textContent = STRINGS.btOff;
+    } else if (connected.length) {
+      els.btSubtitle.textContent = STRINGS.btConnectedTo(
+        connected.map((c) => c.name).join(", "),
+      );
+    } else {
+      els.btSubtitle.textContent = STRINGS.btOn;
+    }
 
-  if (Array.isArray(b.devices) && b.devices.length) {
-    renderConnected(b.devices);
-    renderDevices(b.devices);
-  } else if (Array.isArray(b.connected)) {
-    renderConnected(b.connected);
+    if (Array.isArray(b.devices) && b.devices.length) {
+      renderConnected(b.devices);
+      renderDevices(b.devices);
+    } else if (Array.isArray(b.connected)) {
+      renderConnected(b.connected);
+    }
   }
 
   const p = data.player || {};
   playerPlaying = !!p.playing;
   playerPaused = !!p.paused;
-  setPlayPauseIcon(playerPlaying);
+  setPlayPauseIcon(playerPlaying && !p.loading);
 
-  if (p.playing) {
+  if (p.loading) {
+    els.nowTitle.textContent = p.title
+      ? `${STRINGS.loadingTrack} ${p.title}`
+      : STRINGS.loadingTrack;
+    els.nowSub.hidden = true;
+  } else if (p.playing) {
     els.nowTitle.textContent = p.title || STRINGS.playing;
     if (p.url) {
       els.nowSub.textContent = p.url;
@@ -596,22 +670,7 @@ function applyStatus(data) {
     els.nowSub.hidden = true;
   }
 
-  // Playlist info if backend provides it
-  const pl = p.playlist || p.playlist_info || null;
-  if (pl && (pl.position != null || pl.index != null) && (pl.count != null || pl.total != null)) {
-    const cur = (pl.position ?? pl.index) + (pl.one_based ? 0 : 1);
-    const total = pl.count ?? pl.total;
-    els.playlistInfo.textContent = STRINGS.playlistPos(cur, total);
-    els.playlistInfo.hidden = false;
-  } else if (p.playlist_pos != null && p.playlist_count != null) {
-    els.playlistInfo.textContent = STRINGS.playlistPos(
-      Number(p.playlist_pos) + 1,
-      p.playlist_count,
-    );
-    els.playlistInfo.hidden = false;
-  } else {
-    els.playlistInfo.hidden = true;
-  }
+  renderQueue(p);
 
   updateSeekUI(p.time_pos, p.duration, p.percent);
 
@@ -848,9 +907,9 @@ async function deleteInvite(id) {
   await refreshAccessAdmin();
 }
 
-async function refreshStatus() {
+async function refreshStatus(full = false) {
   try {
-    const data = await api("/api/status");
+    const data = await api(full ? "/api/status" : "/api/status?light=1");
     if (data?.auth_required && !data.ok) {
       setStatus(STRINGS.authRequired);
       return null;
@@ -878,6 +937,7 @@ async function refreshDevices() {
 }
 
 async function togglePower() {
+  if (btPowerSyncing) return;
   const on = els.btPower.checked;
   const prev = !on;
   setBusy(true, on ? STRINGS.turningBtOn : STRINGS.turningBtOff);
@@ -894,7 +954,7 @@ async function togglePower() {
       return;
     }
     setStatus(on ? STRINGS.btOnStatus : STRINGS.btOffStatus);
-    await refreshStatus();
+    await refreshStatus(true);
     if (on) await refreshDevices();
   } catch (e) {
     toast(STRINGS.powerFailed);
@@ -909,7 +969,9 @@ async function scan() {
   setBusy(true, STRINGS.scanning);
   setStatus(STRINGS.scanningStatus);
   try {
+    btPowerSyncing = true;
     els.btPower.checked = true;
+    btPowerSyncing = false;
     const data = await api("/api/bluetooth/scan", {
       method: "POST",
       body: JSON.stringify({ seconds: 18, wait: true }),
@@ -926,7 +988,7 @@ async function scan() {
       toast(data.error);
       setStatus(data.error);
     }
-    await refreshStatus();
+    await refreshStatus(true);
   } catch (e) {
     toast(STRINGS.scanFailed);
     setStatus(STRINGS.scanFailed);
@@ -1100,25 +1162,74 @@ async function resume() {
 }
 
 async function togglePlayPause() {
+  if (!statusReady) {
+    await refreshStatus();
+  }
   if (playerPlaying) {
     await pause();
   } else if (playerPaused) {
     await resume();
   } else {
+    // Don't fire /api/play (which stop()s the current track) just because
+    // the UI hasn't synced yet after a refresh.
+    const data = await refreshStatus();
+    const p = data && data.player;
+    if (p && (p.playing || p.loading)) return;
+    if (p && p.paused) {
+      await resume();
+      return;
+    }
     await play();
   }
 }
 
-async function nextTrack() {
-  const data = await api("/api/next", { method: "POST", body: "{}" });
-  if (!data.ok) toast(data.error || STRINGS.nextFailed);
-  await refreshStatus();
+function transportClick(fn) {
+  return () => {
+    if (Date.now() < transportArmedAt) return;
+    fn();
+  };
 }
 
-async function prevTrack() {
-  const data = await api("/api/previous", { method: "POST", body: "{}" });
-  if (!data.ok) toast(data.error || STRINGS.prevFailed);
-  await refreshStatus();
+function queueSkip(delta) {
+  skipDelta += delta;
+  clearTimeout(skipTimer);
+  skipTimer = setTimeout(flushSkip, 180);
+}
+
+async function flushSkip() {
+  if (skipFlushing) return;
+  const n = skipDelta;
+  skipDelta = 0;
+  if (!n) return;
+  skipFlushing = true;
+  setBusy(true, STRINGS.loadingTrack);
+  try {
+    const data = await api("/api/skip", {
+      method: "POST",
+      body: JSON.stringify({ delta: n }),
+      timeoutMs: 130000,
+    });
+    if (data.superseded) {
+      /* a newer skip won — ignore */
+    } else if (!data.ok) {
+      toast(data.error || (n > 0 ? STRINGS.nextFailed : STRINGS.prevFailed));
+    }
+    await refreshStatus();
+  } catch {
+    toast(n > 0 ? STRINGS.nextFailed : STRINGS.prevFailed);
+  } finally {
+    skipFlushing = false;
+    setBusy(false);
+    if (skipDelta) flushSkip();
+  }
+}
+
+function nextTrack() {
+  queueSkip(1);
+}
+
+function prevTrack() {
+  queueSkip(-1);
 }
 
 async function seekTo(seconds, percent) {
@@ -1504,23 +1615,26 @@ function renderPlaylists(list) {
     actions.appendChild(addUrl);
     actions.appendChild(del);
     const tracks = wrap.querySelector(".pl-tracks");
-    for (const it of items) {
+    items.forEach((it, idx) => {
       const row = document.createElement("div");
       row.className = "pl-item-row";
       row.style.paddingTop = "8px";
       const title = it.title || it.url || it.file_id || "—";
-      row.innerHTML = `
-        <div class="cell-body">
-          <div class="cell-sub">${escapeHtml(title)}</div>
-        </div>`;
+      const playFrom = document.createElement("button");
+      playFrom.type = "button";
+      playFrom.className = "pl-track-btn";
+      playFrom.innerHTML = `<div class="cell-sub">${escapeHtml(title)}</div>`;
+      playFrom.title = STRINGS.playFromHere;
+      playFrom.addEventListener("click", () => playPlaylist(pl.id, pl.name, idx));
       const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "text-btn danger-text";
       rm.textContent = "×";
       rm.addEventListener("click", () => removePlaylistItem(pl.id, it.id));
+      row.appendChild(playFrom);
       row.appendChild(rm);
       tracks.appendChild(row);
-    }
+    });
     group.appendChild(wrap);
   }
 }
@@ -1580,16 +1694,18 @@ async function removePlaylistItem(playlistId, itemId) {
   await refreshPlaylists();
 }
 
-async function playPlaylist(id, name) {
+async function playPlaylist(id, name, startIndex) {
   if (!hasSpeaker) {
     toast(STRINGS.noBtSpeaker);
     return;
   }
   setBusy(true, STRINGS.startingPlayback);
   try {
+    const body = { playlist_id: id };
+    if (startIndex != null) body.start_index = startIndex;
     const data = await api("/api/play/playlist", {
       method: "POST",
-      body: JSON.stringify({ playlist_id: id }),
+      body: JSON.stringify(body),
     });
     if (data.ok) {
       toast(STRINGS.playingPlaylist(data.title || name));
@@ -1834,6 +1950,7 @@ function toggleBtPanel() {
   els.btPanel.hidden = !open;
   els.btToggleRow.setAttribute("aria-expanded", open ? "true" : "false");
   els.btAccordion.classList.toggle("open", open);
+  if (open) refreshDevices();
 }
 
 function bind() {
@@ -1845,10 +1962,11 @@ function bind() {
   });
   els.scanBtn.addEventListener("click", scan);
   els.playBtn.addEventListener("click", play);
-  els.playPauseBtn.addEventListener("click", togglePlayPause);
-  els.stopBtn.addEventListener("click", stop);
-  els.prevBtn.addEventListener("click", prevTrack);
-  els.nextBtn.addEventListener("click", nextTrack);
+  els.playPauseBtn.addEventListener("click", transportClick(togglePlayPause));
+  els.stopBtn.addEventListener("click", transportClick(stop));
+  els.prevBtn.addEventListener("click", transportClick(prevTrack));
+  els.nextBtn.addEventListener("click", transportClick(nextTrack));
+  els.queueToggle.addEventListener("click", toggleQueue);
   els.volSlider.addEventListener("input", onVolumeInput);
   els.volSlider.addEventListener("pointerdown", () => {
     volDragging = true;
@@ -1943,11 +2061,12 @@ async function init() {
   }
 
   bind();
+  transportArmedAt = Date.now() + 700;
+  els.nowTitle.textContent = STRINGS.loadingTrack;
   setPlayPauseIcon(false);
   updatePlaybackEnabled();
   updateRecSecureNote();
   await refreshStatus();
-  await refreshDevices();
   schedulePoll();
 }
 

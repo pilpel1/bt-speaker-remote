@@ -75,7 +75,11 @@
         <div class="player-meta">
           <div class="now-title" id="nowTitle">כלום לא מתנגן</div>
           <div class="now-sub" id="nowSub" hidden></div>
-          <div class="playlist-info" id="playlistInfo" hidden></div>
+          <button type="button" class="queue-toggle" id="queueToggle" hidden>
+            <span id="playlistInfo">תור</span>
+            <span class="queue-chevron" aria-hidden="true"></span>
+          </button>
+          <div class="queue-list" id="queueList" hidden></div>
         </div>
 
         <div class="seek-row">
@@ -169,6 +173,7 @@
         <div class="section-row">
           <p class="section-label">פלייליסטים</p>
         </div>
+        <p class="pl-hint">צור רשימה, הוסף קבצים עם + ליד קובץ בספרייה. לחיצה על שיר = ניגון משם.</p>
         <section class="group">
           <div class="cell">
             <input id="playlistName" class="ios-input" type="text" autocomplete="off" placeholder="שם פלייליסט חדש" />

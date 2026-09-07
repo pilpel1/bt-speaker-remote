@@ -9,6 +9,74 @@ import time
 from typing import Any
 
 ADAPTER_TIMEOUT = 8
+STALE_MSG = (
+    "הרמקול תקוע על חיבור מת. לחץ INPUT (צא מבלוטות׳ וחזור) "
+    "או כבה/הדלק את הרמקול, ואז התחבר שוב."
+)
+
+_connect_lock = threading.Lock()
+_status_cache_lock = threading.Lock()
+_status_cache: dict[str, Any] | None = None
+_status_cache_at: float = 0.0
+_STATUS_CACHE_TTL = 8.0
+
+# Music only. Hands-Free/HSP on this speaker crashes bluetoothd (double free).
+_A2DP_UUIDS = (
+    "0000110b-0000-1000-8000-00805f9b34fb",  # Audio Sink
+    "0000110d-0000-1000-8000-00805f9b34fb",  # A2DP
+)
+_HFP_UUIDS = (
+    "0000111e-0000-1000-8000-00805f9b34fb",
+    "00001108-0000-1000-8000-00805f9b34fb",
+)
+
+
+def _bluez_path(address: str) -> str:
+    return "/org/bluez/hci0/dev_" + address.upper().replace(":", "_")
+
+
+def _busctl(*args: str, timeout: float = 20) -> str:
+    result = _run(["busctl", *args], timeout=timeout)
+    return ((result.stdout or "") + (result.stderr or "")).strip()
+
+
+def _drop_hfp(address: str) -> None:
+    path = _bluez_path(address)
+    for uuid in _HFP_UUIDS:
+        _busctl(
+            "call",
+            "org.bluez",
+            path,
+            "org.bluez.Device1",
+            "DisconnectProfile",
+            "s",
+            uuid,
+            timeout=8,
+        )
+
+
+def _connect_a2dp(address: str) -> str:
+    path = _bluez_path(address)
+    logs: list[str] = []
+    for uuid in _A2DP_UUIDS:
+        out = _busctl(
+            "--timeout=25",
+            "call",
+            "org.bluez",
+            path,
+            "org.bluez.Device1",
+            "ConnectProfile",
+            "s",
+            uuid,
+            timeout=30,
+        )
+        logs.append(out)
+        time.sleep(1.2)
+        info = _bt("info", address, timeout=6)
+        if re.search(r"Connected:\s*yes", info, re.I):
+            break
+    _drop_hfp(address)
+    return "\n".join(logs)
 
 
 def _run(args: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
@@ -36,6 +104,7 @@ def _rfkill_unblock_bluetooth() -> None:
 
 
 def power_on() -> dict[str, Any]:
+    invalidate_status_cache()
     _rfkill_unblock_bluetooth()
     # Retry — BlueZ can return Busy right after unblock/reset
     last = ""
@@ -55,6 +124,7 @@ def power_on() -> dict[str, Any]:
 
 
 def power_off() -> dict[str, Any]:
+    invalidate_status_cache()
     # Disconnect first so audio cleans up
     try:
         for dev in list_devices():
@@ -65,6 +135,32 @@ def power_off() -> dict[str, Any]:
     _bt("power", "off")
     status = get_status()
     return {"ok": not status.get("powered", True), **status}
+
+
+def invalidate_status_cache() -> None:
+    global _status_cache, _status_cache_at
+    with _status_cache_lock:
+        _status_cache = None
+        _status_cache_at = 0.0
+
+
+def get_status_cached(*, force: bool = False, fetch: bool = True) -> dict[str, Any]:
+    """Reuse a recent bluetoothctl dump so polling doesn't poke BlueZ every 1.5s."""
+    global _status_cache, _status_cache_at
+    now = time.time()
+    with _status_cache_lock:
+        cached = _status_cache
+        age = now - _status_cache_at
+    if cached is not None and not force:
+        if not fetch or age < _STATUS_CACHE_TTL:
+            return cached
+    if not fetch:
+        return cached or {}
+    data = get_status()
+    with _status_cache_lock:
+        _status_cache = data
+        _status_cache_at = time.time()
+    return data
 
 
 def get_status() -> dict[str, Any]:
@@ -195,6 +291,7 @@ def scan_and_wait(seconds: float = 18) -> dict[str, Any]:
     if t:
         t.join(timeout=seconds + 5)
     devices = list_devices()
+    invalidate_status_cache()
     return {"ok": True, "devices": devices, "count": len(devices)}
 
 
@@ -255,7 +352,24 @@ def _set_bt_default_sink(address: str) -> str | None:
     return sink
 
 
+def _stale_link_error(log: str) -> bool:
+    return bool(
+        re.search(
+            r"page-timeout|host is down|br-connection-page-timeout",
+            log,
+            re.I,
+        )
+    )
+
+
 def connect(address: str) -> dict[str, Any]:
+    with _connect_lock:
+        result = _connect_locked(address)
+        invalidate_status_cache()
+        return result
+
+
+def _connect_locked(address: str) -> dict[str, Any]:
     address = address.upper().strip()
     power_on()
     info = _bt("info", address, timeout=6)
@@ -279,7 +393,6 @@ agent NoInputNoOutput
 default-agent
 pairable on
 trust {address}
-connect {address}
 quit
 """
     else:
@@ -289,7 +402,6 @@ default-agent
 pairable on
 pair {address}
 trust {address}
-connect {address}
 quit
 """
     proc = subprocess.run(
@@ -297,11 +409,12 @@ quit
         input=script,
         capture_output=True,
         text=True,
-        timeout=55,
+        timeout=45,
         check=False,
     )
     out = (proc.stdout or "") + (proc.stderr or "")
-    time.sleep(2.5)
+    out = out + "\n" + _connect_a2dp(address)
+    time.sleep(1.5)
     info = _bt("info", address, timeout=6)
     connected = bool(re.search(r"Connected:\s*yes", info, re.I))
     paired = bool(re.search(r"Paired:\s*yes", info, re.I))
@@ -311,6 +424,19 @@ quit
         profile = _force_a2dp_profile(address)
         sink = _set_bt_default_sink(address)
     name_m = re.search(r"^\s*Name:\s*(.+)$", info, re.M)
+    if connected:
+        error = None
+    else:
+        extra = out
+        if not _stale_link_error(extra):
+            journal = _run(
+                ["journalctl", "-u", "bluetooth", "--since", "45 sec ago", "--no-pager"],
+                timeout=4,
+            )
+            extra = extra + "\n" + (journal.stdout or "")
+        error = STALE_MSG if _stale_link_error(extra) else (
+            "Connection failed. Put speaker in pairing mode and try again."
+        )
     return {
         "ok": connected,
         "address": address,
@@ -320,7 +446,7 @@ quit
         "audio_sink": sink,
         "profile": profile,
         "log": out[-1500:],
-        "error": None if connected else "Connection failed. Put speaker in pairing mode and try again.",
+        "error": error,
     }
 
 
@@ -335,6 +461,7 @@ def disconnect(address: str | None = None) -> dict[str, Any]:
     time.sleep(0.5)
     info = _bt("info", address, timeout=6)
     still = bool(re.search(r"Connected:\s*yes", info, re.I))
+    invalidate_status_cache()
     return {"ok": not still, "address": address, "connected": still}
 
 
@@ -342,4 +469,5 @@ def remove_device(address: str) -> dict[str, Any]:
     address = address.upper().strip()
     _bt("disconnect", address, timeout=8)
     out = _bt("remove", address, timeout=8)
+    invalidate_status_cache()
     return {"ok": "been removed" in out.lower() or "not available" in out.lower(), "log": out}

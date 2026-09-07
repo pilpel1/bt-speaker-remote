@@ -227,8 +227,21 @@ def auth_admin_delete_invite():
 @app.get("/api/status")
 @require_token
 def status():
+    light = str(request.args.get("light") or "").lower() in ("1", "true", "yes")
     try:
-        b = bt.get_status()
+        if light:
+            b = bt.get_status_cached(force=False, fetch=False)
+            if not b:
+                b = {"powered": True, "connected": [], "devices": []}
+            # pactl only — bluetoothctl on page refresh can drop A2DP (BCM43142).
+            if player.has_bt_audio() and not (b.get("connected") or []):
+                b = {
+                    **b,
+                    "powered": True,
+                    "connected": [{"name": "רמקול", "connected": True, "is_audio": True}],
+                }
+        else:
+            b = bt.get_status_cached(force=True, fetch=True)
     except Exception as e:
         b = {"error": str(e), "powered": False, "connected": [], "devices": []}
     try:
@@ -247,6 +260,7 @@ def status():
             "player": p,
             "volume": v.get("volume"),
             "auth": auth,
+            "light": light,
         }
     )
 
@@ -433,7 +447,11 @@ def play_playlist():
         err, code = _ensure_speaker_ready()
         if err is not None:
             return err, code
-        result = player.play_list(sources, title=pl.get("name"))
+        result = player.play_list(
+            sources,
+            title=pl.get("name"),
+            start_index=int(data.get("start_index") or data.get("index") or 0),
+        )
         _record_play_history(
             result,
             source="playlist",
@@ -707,11 +725,32 @@ def seek():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/skip")
+@require_token
+def skip_tracks():
+    data = request.get_json(silent=True) or {}
+    try:
+        if data.get("index") is not None:
+            result = player.skip_tracks(index=int(data.get("index")))
+        else:
+            result = player.skip_tracks(delta=int(data.get("delta", data.get("n", 1))))
+        if result.get("superseded"):
+            return jsonify({**player.get_status(), "ok": True, "superseded": True})
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid delta"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/api/next")
 @require_token
 def next_track():
     try:
-        result = player.next_track()
+        result = player.skip_tracks(1)
+        if result.get("superseded"):
+            return jsonify({**player.get_status(), "ok": True, "superseded": True})
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
     except Exception as e:
@@ -722,7 +761,9 @@ def next_track():
 @require_token
 def previous_track():
     try:
-        result = player.previous_track()
+        result = player.skip_tracks(-1)
+        if result.get("superseded"):
+            return jsonify({**player.get_status(), "ok": True, "superseded": True})
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
     except Exception as e:
