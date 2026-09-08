@@ -230,16 +230,15 @@ def status():
     light = str(request.args.get("light") or "").lower() in ("1", "true", "yes")
     try:
         if light:
-            b = bt.get_status_cached(force=False, fetch=False)
-            if not b:
-                b = {"powered": True, "connected": [], "devices": []}
-            # pactl only — bluetoothctl on page refresh can drop A2DP (BCM43142).
-            if player.has_bt_audio() and not (b.get("connected") or []):
-                b = {
-                    **b,
-                    "powered": True,
-                    "connected": [{"name": "רמקול", "connected": True, "is_audio": True}],
-                }
+            # busctl peek / cache only — bluetoothctl on refresh can drop A2DP (BCM43142).
+            b = bt.get_status_light()
+            if player.has_bt_audio():
+                b = {**b, "powered": True}
+                if not (b.get("connected") or []):
+                    b = {
+                        **b,
+                        "connected": [{"name": "רמקול", "connected": True, "is_audio": True}],
+                    }
         else:
             b = bt.get_status_cached(force=True, fetch=True)
     except Exception as e:

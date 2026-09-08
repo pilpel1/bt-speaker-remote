@@ -109,6 +109,64 @@ def _yt_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+_GENERIC_TRACK_RE = re.compile(r"^רצועה\s+\d+$")
+
+
+def _clean_title(value: Any) -> str:
+    t = str(value or "").strip()
+    if not t or _GENERIC_TRACK_RE.match(t):
+        return ""
+    return t[:200]
+
+
+def _yt_video_id(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    m = re.search(r"(?:v=|/shorts/|/embed/|youtu\.be/)([A-Za-z0-9_-]{11})", u)
+    return m.group(1) if m else ""
+
+
+def _same_track_url(a: str, b: str) -> bool:
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ia, ib = _yt_video_id(a), _yt_video_id(b)
+    return bool(ia and ia == ib)
+
+
+def _remember_queue_title(index: int, title: str | None) -> None:
+    """Fill a missing/generic per-track title. Safe under _lock (RLock)."""
+    nice = _clean_title(title)
+    if not nice or index < 0:
+        return
+    with _lock:
+        if index >= len(_queue):
+            return
+        while len(_queue_titles) <= index:
+            _queue_titles.append("")
+        if not _clean_title(_queue_titles[index]):
+            _queue_titles[index] = nice
+
+
+def _title_known_for_url(url: str) -> str:
+    """Title already known for this url (now-playing or earlier queue entry)."""
+    with _lock:
+        if _same_track_url(url, str(_state.get("url") or "")):
+            nice = _clean_title(_state.get("title"))
+            if nice:
+                return nice
+        for i, u in enumerate(_queue):
+            if _same_track_url(url, u) and i < len(_queue_titles):
+                nice = _clean_title(_queue_titles[i])
+                if nice:
+                    return nice
+    return ""
+
+
 def _expand_yt_playlist(url: str, limit: int = 80) -> tuple[list[tuple[str, str]], str]:
     """Return ([(watch_url, title), ...], playlist_title)."""
     try:
@@ -1342,6 +1400,12 @@ def play_list(
             display = f"{display} · {len(sources)} רצועות"
     if len(sources) > 1 and "רצועות" not in display:
         display = f"{display} · {len(sources)} רצועות"
+    # play() used to keep the real name only in _queue_title / _state.
+    # When a second track was enqueued, the first row fell back to "רצועה 1".
+    if len(sources) == 1:
+        seed = _clean_title(title) or _clean_title(display)
+        if seed and not _clean_title(titles[0]):
+            titles[0] = seed
 
     print(f"[bt-speaker] queue {len(sources)} track(s)", flush=True)
 
@@ -1387,14 +1451,17 @@ def enqueue(
     titles = list(source_titles)
     while len(titles) < len(sources):
         titles.append("")
+    passed = _clean_title(title)
     for i, src in enumerate(sources):
-        if not titles[i]:
-            if title and i == 0:
-                titles[i] = title[:200]
+        if not _clean_title(titles[i]):
+            if passed and i == 0:
+                titles[i] = passed
             elif not _is_http_url(src):
                 titles[i] = _local_title(src)
-    if len(sources) == 1 and title:
-        titles[0] = title[:200]
+            else:
+                titles[i] = _title_known_for_url(src)
+    if len(sources) == 1 and passed:
+        titles[0] = passed
 
     start_now = False
     with _lock:
@@ -1403,19 +1470,28 @@ def enqueue(
             cur = (_state.get("url") or "").strip()
             if alive and cur:
                 _queue = [cur]
-                _queue_titles = [str(_state.get("title") or "")[:200]]
+                _queue_titles = [_clean_title(_state.get("title"))]
                 _queue_index = 0
                 if not _queue_title:
                     _queue_title = _state.get("title")
             else:
                 start_now = True
         if not start_now:
+            seed = _clean_title(_state.get("title"))
+            if not seed:
+                qt = str(_queue_title or "")
+                if "רצועות" not in qt:
+                    seed = _clean_title(qt)
+            _remember_queue_title(_queue_index, seed)
+            while len(_queue_titles) < len(_queue):
+                _queue_titles.append("")
             # skip exact duplicate of the last queued url
             for src, ttl in zip(sources, titles):
                 if _queue and _queue[-1] == src:
                     continue
+                nice = _clean_title(ttl) or _title_known_for_url(src)
                 _queue.append(src)
-                _queue_titles.append(ttl)
+                _queue_titles.append(nice)
             if _queue_title and "רצועות" not in str(_queue_title) and len(_queue) > 1:
                 _queue_title = f"{_queue_title} · {len(_queue)} רצועות"
             added_at = len(_queue) - 1
@@ -1562,6 +1638,7 @@ def skip_tracks(delta: int | None = None, index: int | None = None) -> dict[str,
     if isinstance(media, str) and media.strip():
         with _lock:
             _state["title"] = media.strip()
+            _remember_queue_title(_queue_index, media.strip())
     return _with_status(True)
 
 
@@ -1607,11 +1684,15 @@ def get_status() -> dict[str, Any]:
             qitems: list[dict[str, Any]] = []
             for i, u in enumerate(_queue):
                 t = ""
-                if i < len(_queue_titles) and _queue_titles[i]:
-                    t = _queue_titles[i]
-                elif not _is_http_url(u):
+                if i < len(_queue_titles):
+                    t = _clean_title(_queue_titles[i])
+                if not t and i == qidx:
+                    t = _clean_title(title)
+                    if t:
+                        _remember_queue_title(i, t)
+                if not t and not _is_http_url(u):
                     t = _local_title(u)
-                else:
+                if not t:
                     t = f"רצועה {i + 1}"
                 job = _jobs.get(u) or {}
                 path = job.get("path") if isinstance(job.get("path"), Path) else None
@@ -1671,14 +1752,17 @@ def get_status() -> dict[str, Any]:
         except (TypeError, ValueError):
             base["playlist_count"] = None
 
-    if not our_queue:
-        media = _mpv_get("media-title")
-        if isinstance(media, str) and media.strip():
-            pl_count = base.get("playlist_count") or 0
-            if pl_count > 1:
-                base["title"] = media.strip()
-                with _lock:
+    media = _mpv_get("media-title")
+    if isinstance(media, str) and media.strip():
+        with _lock:
+            if our_queue:
+                _remember_queue_title(_queue_index, media.strip())
+            else:
+                pl_count = base.get("playlist_count") or 0
+                if pl_count > 1:
+                    base["title"] = media.strip()
                     _state["title"] = media.strip()
+                    _remember_queue_title(_queue_index, media.strip())
 
     return base
 

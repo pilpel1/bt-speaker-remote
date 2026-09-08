@@ -248,6 +248,7 @@ let skipDelta = 0;
 let skipTimer = null;
 let skipFlushing = false;
 let queueOpen = false;
+let lastPlayer = {};
 
 function getToken() {
   return localStorage.getItem(LS_TOKEN) || "";
@@ -614,41 +615,50 @@ function renderDevices(devices) {
   }
 }
 
+function applyBluetooth(b) {
+  if (!b || typeof b !== "object") return;
+
+  if (typeof b.powered === "boolean") {
+    btPowerSyncing = true;
+    els.btPower.checked = b.powered;
+    btPowerSyncing = false;
+  }
+
+  const connected = Array.isArray(b.connected) ? b.connected : [];
+  const devices = Array.isArray(b.devices) ? b.devices : [];
+  hasSpeaker = connected.length > 0 || devices.some((d) => d.connected);
+
+  if (b.powered === false) {
+    els.btSubtitle.textContent = STRINGS.btOff;
+  } else if (hasSpeaker) {
+    const names = (connected.length ? connected : devices.filter((d) => d.connected))
+      .map((c) => c.name)
+      .filter(Boolean);
+    els.btSubtitle.textContent = names.length
+      ? STRINGS.btConnectedTo(names.join(", "))
+      : STRINGS.btOn;
+  } else if (b.powered) {
+    els.btSubtitle.textContent = STRINGS.btOn;
+  }
+
+  const realDevices = devices.filter((d) => d.address);
+  if (realDevices.length) {
+    renderConnected(realDevices);
+    renderDevices(realDevices);
+  } else if (connected.some((d) => d.address)) {
+    renderConnected(connected);
+  }
+}
+
 function applyStatus(data) {
   if (!data) return;
   if (data.host) els.hostLabel.textContent = data.host;
   statusReady = true;
 
-  const b = data.bluetooth || {};
-  if (!data.light) {
-    const powered = !!b.powered;
-    btPowerSyncing = true;
-    els.btPower.checked = powered;
-    btPowerSyncing = false;
-    const connected = b.connected || [];
-    hasSpeaker = Array.isArray(connected) && connected.length > 0;
-    if (!hasSpeaker && Array.isArray(b.devices)) {
-      hasSpeaker = b.devices.some((d) => d.connected);
-    }
-    if (!powered) {
-      els.btSubtitle.textContent = STRINGS.btOff;
-    } else if (connected.length) {
-      els.btSubtitle.textContent = STRINGS.btConnectedTo(
-        connected.map((c) => c.name).join(", "),
-      );
-    } else {
-      els.btSubtitle.textContent = STRINGS.btOn;
-    }
-
-    if (Array.isArray(b.devices) && b.devices.length) {
-      renderConnected(b.devices);
-      renderDevices(b.devices);
-    } else if (Array.isArray(b.connected)) {
-      renderConnected(b.connected);
-    }
-  }
+  applyBluetooth(data.bluetooth || {});
 
   const p = data.player || {};
+  lastPlayer = p;
   playerPlaying = !!p.playing;
   playerPaused = !!p.paused;
   setPlayPauseIcon(playerPlaying && !p.loading);
@@ -1367,6 +1377,29 @@ function miniIconBtn(kind, label, onClick) {
 const ICON_QUEUE = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3V6zm0 5h12v2H3v-2zm0 5h12v2H3v-2zm14-1.5v3h3v2h-3v3h-2v-3h-3v-2h3v-3h2z"/></svg>`;
 const ICON_SAVE = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v16l7-3 7 3V5a2 2 0 0 0-2-2zm0 15.76-5-2.15-5 2.15V5h10v13.76z"/></svg>`;
 
+function youtubeId(url) {
+  const m = String(url || "").match(/(?:v=|\/shorts\/|\/embed\/|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : "";
+}
+
+function sameTrackUrl(a, b) {
+  a = String(a || "").trim();
+  b = String(b || "").trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const ia = youtubeId(a);
+  const ib = youtubeId(b);
+  return !!(ia && ia === ib);
+}
+
+function titleForQueueUrl(url, title) {
+  const given = String(title || "").trim();
+  if (given) return given;
+  const cur = String(lastPlayer.title || "").trim();
+  if (cur && sameTrackUrl(url, lastPlayer.url)) return cur;
+  return null;
+}
+
 async function enqueueUrl(url, title, expand) {
   if (!url) {
     toast(STRINGS.pasteUrlFirst);
@@ -1376,6 +1409,7 @@ async function enqueueUrl(url, title, expand) {
     toast(STRINGS.noBtSpeaker);
     return;
   }
+  title = titleForQueueUrl(url, title);
   const data = await api("/api/queue", {
     method: "POST",
     body: JSON.stringify({ url, title, expand: expand !== false }),
@@ -1410,7 +1444,8 @@ async function enqueueFile(fileId, title) {
 }
 
 async function queueCurrentUrl() {
-  await enqueueUrl(els.ytUrl.value.trim(), null, true);
+  const url = els.ytUrl.value.trim() || lastPlayer.url || "";
+  await enqueueUrl(url, lastPlayer.title || null, true);
 }
 
 async function searchYoutube() {

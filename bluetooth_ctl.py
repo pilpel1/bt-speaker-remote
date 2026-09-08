@@ -144,9 +144,15 @@ def invalidate_status_cache() -> None:
         _status_cache_at = 0.0
 
 
+def _put_status_cache(data: dict[str, Any]) -> None:
+    global _status_cache, _status_cache_at
+    with _status_cache_lock:
+        _status_cache = data
+        _status_cache_at = time.time()
+
+
 def get_status_cached(*, force: bool = False, fetch: bool = True) -> dict[str, Any]:
     """Reuse a recent bluetoothctl dump so polling doesn't poke BlueZ every 1.5s."""
-    global _status_cache, _status_cache_at
     now = time.time()
     with _status_cache_lock:
         cached = _status_cache
@@ -157,9 +163,103 @@ def get_status_cached(*, force: bool = False, fetch: bool = True) -> dict[str, A
     if not fetch:
         return cached or {}
     data = get_status()
+    _put_status_cache(data)
+    return data
+
+
+def _busctl_prop(path: str, iface: str, name: str, timeout: float = 3) -> str:
+    return _busctl(
+        "get-property",
+        "org.bluez",
+        path,
+        iface,
+        name,
+        timeout=timeout,
+    )
+
+
+def _parse_busctl_bool(raw: str) -> bool:
+    return bool(re.search(r"\btrue\b", raw, re.I))
+
+
+def _parse_busctl_str(raw: str) -> str:
+    m = re.search(r'"((?:\\.|[^"\\])*)"', raw)
+    if not m:
+        return ""
+    return m.group(1).replace(r"\"", '"')
+
+
+def peek_status() -> dict[str, Any]:
+    """Read-only BlueZ via busctl. Avoids bluetoothctl (BCM43142 can drop A2DP)."""
+    powered = False
+    adapter = "/org/bluez/hci0"
+    tree = _busctl("tree", "org.bluez", timeout=4)
+    adapters = re.findall(r"/org/bluez/hci\d+(?=/|$)", tree)
+    if adapters:
+        adapter = adapters[0]
+    raw_powered = _busctl_prop(adapter, "org.bluez.Adapter1", "Powered")
+    if raw_powered:
+        powered = _parse_busctl_bool(raw_powered)
+    paths = sorted(set(re.findall(r"/org/bluez/hci\d+/dev_[0-9A-Fa-f_]+", tree)))
+    devices: list[dict[str, Any]] = []
+    for path in paths:
+        connected = _parse_busctl_bool(_busctl_prop(path, "org.bluez.Device1", "Connected"))
+        name = _parse_busctl_str(_busctl_prop(path, "org.bluez.Device1", "Name"))
+        alias = _parse_busctl_str(_busctl_prop(path, "org.bluez.Device1", "Alias"))
+        address = _parse_busctl_str(_busctl_prop(path, "org.bluez.Device1", "Address"))
+        icon = _parse_busctl_str(_busctl_prop(path, "org.bluez.Device1", "Icon"))
+        paired = _parse_busctl_bool(_busctl_prop(path, "org.bluez.Device1", "Paired"))
+        uuids_raw = _busctl_prop(path, "org.bluez.Device1", "UUIDs")
+        if not address:
+            m = re.search(r"dev_([0-9A-Fa-f_]+)$", path)
+            if m:
+                address = m.group(1).replace("_", ":").upper()
+        is_audio = (
+            "audio" in icon.lower()
+            or "headset" in icon.lower()
+            or "0000110b" in uuids_raw.lower()
+            or "0000110d" in uuids_raw.lower()
+            or "0000110a" in uuids_raw.lower()
+            or "audio" in uuids_raw.lower()
+            or "a2dp" in uuids_raw.lower()
+        )
+        devices.append(
+            {
+                "address": address.upper() if address else "",
+                "name": name or alias or address or path.rsplit("/", 1)[-1],
+                "icon": icon,
+                "class": "",
+                "rssi": None,
+                "paired": paired,
+                "trusted": False,
+                "connected": connected,
+                "is_audio": is_audio,
+            }
+        )
+    devices.sort(key=lambda d: (not d["is_audio"], not d["connected"], d["name"].lower()))
+    connected = [d for d in devices if d.get("connected")]
+    return {
+        "powered": powered,
+        "discovering": False,
+        "adapter_name": "Bluetooth host",
+        "connected": connected,
+        "devices": devices,
+        "device_count": len(devices),
+    }
+
+
+def get_status_light() -> dict[str, Any]:
+    """Fresh-enough status for polling. Never calls bluetoothctl."""
     with _status_cache_lock:
-        _status_cache = data
-        _status_cache_at = time.time()
+        cached = _status_cache
+        age = time.time() - _status_cache_at
+    if cached is not None and age < _STATUS_CACHE_TTL:
+        return cached
+    try:
+        data = peek_status()
+    except Exception:
+        return cached or {"powered": False, "connected": [], "devices": []}
+    _put_status_cache(data)
     return data
 
 
