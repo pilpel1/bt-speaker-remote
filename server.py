@@ -15,6 +15,7 @@ import bluetooth_ctl as bt
 import library
 import media_store
 import player
+import validate
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -282,7 +283,10 @@ def bluetooth_power():
 @require_token
 def bluetooth_scan():
     data = request.get_json(silent=True) or {}
-    seconds = float(data.get("seconds", 18))
+    try:
+        seconds = float(data.get("seconds", 18))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": validate.ERR_BAD_SCAN}), 400
     seconds = max(5, min(30, seconds))
     wait = bool(data.get("wait", True))
     try:
@@ -309,7 +313,9 @@ def bluetooth_connect():
     data = request.get_json(silent=True) or {}
     address = (data.get("address") or "").strip()
     if not address:
-        return jsonify({"ok": False, "error": "Missing address"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_ADDRESS}), 400
+    if not validate.is_bt_address(address):
+        return jsonify({"ok": False, "error": validate.ERR_BAD_ADDRESS}), 400
     try:
         result = bt.connect(address)
         player.ensure_bt_sink_default()
@@ -322,7 +328,9 @@ def bluetooth_connect():
 @require_token
 def bluetooth_disconnect():
     data = request.get_json(silent=True) or {}
-    address = data.get("address") or None
+    address = (data.get("address") or "").strip() or None
+    if address and not validate.is_bt_address(address):
+        return jsonify({"ok": False, "error": validate.ERR_BAD_ADDRESS}), 400
     try:
         player.stop()
         return jsonify(bt.disconnect(address))
@@ -336,7 +344,9 @@ def bluetooth_remove():
     data = request.get_json(silent=True) or {}
     address = (data.get("address") or "").strip()
     if not address:
-        return jsonify({"ok": False, "error": "Missing address"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_ADDRESS}), 400
+    if not validate.is_bt_address(address):
+        return jsonify({"ok": False, "error": validate.ERR_BAD_ADDRESS}), 400
     try:
         player.stop()
         return jsonify(bt.remove_device(address))
@@ -359,7 +369,7 @@ def _bt_speaker_connected() -> bool:
 def _ensure_speaker_ready():
     """Return (error_response, status_code) or (None, None) if ready."""
     if not _bt_speaker_connected():
-        return jsonify({"ok": False, "error": "No Bluetooth speaker connected"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_NO_SPEAKER}), 400
     try:
         st = bt.get_status()
         if not st.get("powered"):
@@ -396,7 +406,12 @@ def play():
     url = (data.get("url") or data.get("link") or "").strip()
     file_id = (data.get("file_id") or "").strip()
     if not url and not file_id:
-        return jsonify({"ok": False, "error": "Missing url or file_id"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_URL_OR_FILE}), 400
+    if url:
+        url_err = validate.play_url_error(url)
+        if url_err:
+            return jsonify({"ok": False, "error": url_err}), 400
+        url = validate.coerce_play_url(url) or url
     try:
         err, code = _ensure_speaker_ready()
         if err is not None:
@@ -405,7 +420,7 @@ def play():
         if file_id:
             item = library.resolve(file_id)
             if not item:
-                return jsonify({"ok": False, "error": "File not found"}), 404
+                return jsonify({"ok": False, "error": validate.friendly("File not found")}), 404
             result = player.play(str(item["path"]), title=item.get("title") or title)
             _record_play_history(
                 result,
@@ -416,6 +431,8 @@ def play():
         else:
             result = player.play(url, title=title)
             _record_play_history(result, source="url", url=url, title=title)
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         code = 200 if result.get("ok") else 500
         return jsonify(result), code
     except Exception as e:
@@ -431,7 +448,12 @@ def enqueue():
     title = (data.get("title") or "").strip() or None
     expand = True if data.get("expand") is None else bool(data.get("expand"))
     if not url and not file_id:
-        return jsonify({"ok": False, "error": "Missing url or file_id"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_URL_OR_FILE}), 400
+    if url:
+        url_err = validate.play_url_error(url)
+        if url_err:
+            return jsonify({"ok": False, "error": url_err}), 400
+        url = validate.coerce_play_url(url) or url
     try:
         err, code = _ensure_speaker_ready()
         if err is not None:
@@ -439,7 +461,7 @@ def enqueue():
         if file_id:
             item = library.resolve(file_id)
             if not item:
-                return jsonify({"ok": False, "error": "File not found"}), 404
+                return jsonify({"ok": False, "error": validate.friendly("File not found")}), 404
             result = player.enqueue(
                 [str(item["path"])],
                 title=item.get("title") or title,
@@ -447,6 +469,8 @@ def enqueue():
             )
         else:
             result = player.enqueue([url], title=title, expand=expand)
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
     except Exception as e:
@@ -459,10 +483,10 @@ def play_playlist():
     data = request.get_json(silent=True) or {}
     playlist_id = (data.get("playlist_id") or data.get("id") or "").strip()
     if not playlist_id:
-        return jsonify({"ok": False, "error": "Missing playlist_id"}), 400
+        return jsonify({"ok": False, "error": validate.friendly("Missing playlist_id")}), 400
     pl = media_store.get_playlist(playlist_id)
     if not pl:
-        return jsonify({"ok": False, "error": "Playlist not found"}), 404
+        return jsonify({"ok": False, "error": validate.friendly("Playlist not found")}), 404
     sources: list[str] = []
     for it in pl.get("items") or []:
         if it.get("kind") == "file" and it.get("file_id"):
@@ -472,7 +496,12 @@ def play_playlist():
         elif it.get("kind") == "url" and it.get("url"):
             sources.append(it["url"])
     if not sources:
-        return jsonify({"ok": False, "error": "Playlist is empty"}), 400
+        return jsonify({"ok": False, "error": validate.friendly("Playlist is empty")}), 400
+    raw_idx = data.get("start_index", data.get("index", 0))
+    try:
+        start_index = int(raw_idx if raw_idx is not None else 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": validate.friendly("Invalid index")}), 400
     try:
         err, code = _ensure_speaker_ready()
         if err is not None:
@@ -480,8 +509,10 @@ def play_playlist():
         result = player.play_list(
             sources,
             title=pl.get("name"),
-            start_index=int(data.get("start_index") or data.get("index") or 0),
+            start_index=start_index,
         )
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         _record_play_history(
             result,
             source="playlist",
@@ -551,7 +582,11 @@ def library_save_url():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or data.get("link") or "").strip()
     if not url:
-        return jsonify({"ok": False, "error": "Missing url"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_URL}), 400
+    url_err = validate.play_url_error(url)
+    if url_err:
+        return jsonify({"ok": False, "error": url_err}), 400
+    url = validate.coerce_play_url(url) or url
     try:
         result = library.save_url_async(url)
         code = 200 if result.get("ok") else 400
@@ -583,7 +618,7 @@ def record_upload():
         if play_now:
             err, code = _ensure_speaker_ready()
             if err is not None:
-                return jsonify({**result, "played": False, "play_error": "No Bluetooth speaker connected"}), 200
+                return jsonify({**result, "played": False, "play_error": validate.ERR_NO_SPEAKER}), 200
             item = library.resolve(file_info.get("id") or "")
             if item:
                 played = player.play(str(item["path"]), title=item.get("title") or "הקלטה")
@@ -720,7 +755,11 @@ def stop():
 @require_token
 def pause():
     try:
-        return jsonify(player.pause())
+        result = player.pause()
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -729,7 +768,11 @@ def pause():
 @require_token
 def resume():
     try:
-        return jsonify(player.resume())
+        result = player.resume()
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -747,10 +790,12 @@ def seek():
             seconds=float(seconds) if seconds is not None else None,
             percent=float(percent) if percent is not None else None,
         )
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Invalid seconds/percent"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_BAD_SEEK}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -764,12 +809,14 @@ def skip_tracks():
             result = player.skip_tracks(index=int(data.get("index")))
         else:
             result = player.skip_tracks(delta=int(data.get("delta", data.get("n", 1))))
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         if result.get("superseded"):
             return jsonify({**player.get_status(), "ok": True, "superseded": True})
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Invalid delta"}), 400
+        return jsonify({"ok": False, "error": validate.ERR_BAD_SKIP}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -779,6 +826,8 @@ def skip_tracks():
 def next_track():
     try:
         result = player.skip_tracks(1)
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         if result.get("superseded"):
             return jsonify({**player.get_status(), "ok": True, "superseded": True})
         code = 200 if result.get("ok") else 400
@@ -792,6 +841,8 @@ def next_track():
 def previous_track():
     try:
         result = player.skip_tracks(-1)
+        if result.get("error"):
+            result = {**result, "error": validate.friendly(result.get("error"))}
         if result.get("superseded"):
             return jsonify({**player.get_status(), "ok": True, "superseded": True})
         code = 200 if result.get("ok") else 400
@@ -807,7 +858,7 @@ def search():
     q = (data.get("q") or data.get("query") or request.args.get("q") or request.args.get("query") or "").strip()
     limit = data.get("limit", request.args.get("limit", 10))
     if not q:
-        return jsonify({"ok": False, "error": "Missing q", "results": []}), 400
+        return jsonify({"ok": False, "error": validate.ERR_MISSING_SEARCH, "results": []}), 400
     try:
         result = player.search_youtube(q, limit=limit)
         code = 200 if result.get("ok") else 500
@@ -821,10 +872,14 @@ def search():
 def volume():
     data = request.get_json(silent=True) or {}
     if "percent" not in data and "volume" not in data:
-        return jsonify({"ok": False, "error": "Provide percent"}), 400
+        return jsonify({"ok": False, "error": validate.friendly("Provide percent")}), 400
     percent = data.get("percent", data.get("volume"))
     try:
-        return jsonify(player.set_volume(int(percent)))
+        pct = int(percent)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": validate.ERR_BAD_VOLUME}), 400
+    try:
+        return jsonify(player.set_volume(pct))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
