@@ -119,7 +119,7 @@ def power_on() -> dict[str, Any]:
     return {
         "ok": status.get("powered", False),
         **status,
-        "error": None if status.get("powered") else (last or "Failed to power on Bluetooth"),
+        "error": None if status.get("powered") else (last or "הפעלת בלוטות׳ נכשלה"),
     }
 
 
@@ -484,7 +484,7 @@ def _connect_locked(address: str) -> dict[str, Any]:
         if "not available" in info.lower():
             return {
                 "ok": False,
-                "error": f"Device {address} not found. Scan again with speaker in pairing mode.",
+                "error": f"המכשיר {address} לא נמצא. סרוק שוב כשהרמקול במצב זיווג.",
             }
 
     if already_paired:
@@ -535,7 +535,7 @@ quit
             )
             extra = extra + "\n" + (journal.stdout or "")
         error = STALE_MSG if _stale_link_error(extra) else (
-            "Connection failed. Put speaker in pairing mode and try again."
+            "החיבור נכשל. שים את הרמקול במצב זיווג ונסה שוב."
         )
     return {
         "ok": connected,

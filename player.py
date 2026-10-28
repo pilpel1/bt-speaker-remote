@@ -800,13 +800,16 @@ def _local_title(path: str) -> str:
 
 
 def _normalize_sources(items: list[str]) -> list[str]:
+    from validate import coerce_play_url
+
     out: list[str] = []
     for raw in items:
         src = (raw or "").strip()
         if not src:
             continue
-        if _is_http_url(src):
-            out.append(src)
+        coerced = coerce_play_url(src)
+        if coerced:
+            out.append(coerced)
             continue
         p = Path(src).expanduser()
         if p.is_file():
