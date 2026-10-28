@@ -1,5 +1,5 @@
 /* Minimal service worker — enables installability where secure context allows. */
-const CACHE = "bt-speaker-shell-v10";
+const CACHE = "bt-speaker-shell-v11";
 const PRECACHE = [
   "/",
   "/static/style.css",
@@ -9,6 +9,14 @@ const PRECACHE = [
   "/static/icons/apple-touch-icon.png",
   "/manifest.webmanifest",
 ];
+
+function shouldCache(url) {
+  return (
+    url.pathname.startsWith("/static/") ||
+    url.pathname === "/" ||
+    url.pathname.endsWith(".webmanifest")
+  );
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -31,18 +39,16 @@ self.addEventListener("fetch", (event) => {
   // Never cache API — always network
   if (url.pathname.startsWith("/api/")) return;
 
+  // Network-first so a phone PWA picks up server updates; cache is offline fallback.
   event.respondWith(
-    caches.match(req).then((cached) => {
-      const network = fetch(req)
-        .then((res) => {
-          if (res && res.ok && (url.pathname.startsWith("/static/") || url.pathname === "/" || url.pathname.endsWith(".webmanifest"))) {
-            const copy = res.clone();
-            caches.open(CACHE).then((cache) => cache.put(req, copy));
-          }
-          return res;
-        })
-        .catch(() => cached);
-      return cached || network;
-    }),
+    fetch(req)
+      .then((res) => {
+        if (res && res.ok && shouldCache(url)) {
+          const copy = res.clone();
+          caches.open(CACHE).then((cache) => cache.put(req, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(req).then((cached) => cached || caches.match("/"))),
   );
 });
