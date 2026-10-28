@@ -130,7 +130,8 @@ const STRINGS = {
   recDenied: "אין גישה למיקרופון",
   recUnsupported: "הדפדפן לא תומך בהקלטה",
   recHintIdle: "לחץ כדי להקליט הודעה מהטלפון ולשלוח לרמקול בבית.",
-  recHintRecording: "מקליט… בחר שלח או שמור כשתסיים.",
+  recHintRecording: "מקליט… לחץ שוב כדי לעצור.",
+  recHintReady: "מוכן. שלח לרמקול או שמור בלי לנגן.",
   recSending: "שולח לרמקול…",
   recSaved: "ההקלטה נשמרה",
   recSent: "נשלח לרמקול",
@@ -142,6 +143,11 @@ const STRINGS = {
   kindExtra: "תיקייה",
   tracks: (n) => `${n} רצועות`,
   addCurrentUrl: "הוסף את הקישור הנוכחי",
+  playFromHere: "נגן מכאן",
+  badUrl: "קישור לא תקין. הדבק קישור יוטיוב מלא",
+  badYoutube: "קישור יוטיוב חסר מזהה סרטון או פלייליסט",
+  offline: "אין חיבור לשרת. בדוק Wi‑Fi או Tailscale",
+  searchingResults: "מחפש…",
 };
 
 const els = {
@@ -211,6 +217,7 @@ const els = {
   plPicker: $("#plPicker"),
   plPickerList: $("#plPickerList"),
   plPickerCancel: $("#plPickerCancel"),
+  offlineBanner: $("#offlineBanner"),
 };
 
 const LS_URL = "btSpeaker.lastUrl";
@@ -249,6 +256,8 @@ let skipTimer = null;
 let skipFlushing = false;
 let queueOpen = false;
 let lastPlayer = {};
+let transportArmedAt = 0;
+let actionBusy = false;
 
 function getToken() {
   return localStorage.getItem(LS_TOKEN) || "";
@@ -257,6 +266,82 @@ function getToken() {
 function setToken(t) {
   if (t) localStorage.setItem(LS_TOKEN, t);
   else localStorage.removeItem(LS_TOKEN);
+}
+
+function setOffline(off) {
+  if (!els.offlineBanner) return;
+  els.offlineBanner.hidden = !off;
+}
+
+function ytHostOf(raw) {
+  const host = String(raw || "")
+    .split("/")[0]
+    .split("?")[0]
+    .split(":")[0]
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
+  return host;
+}
+
+function isYtHost(host) {
+  const h = String(host || "").toLowerCase().replace(/^www\./, "");
+  return (
+    h === "youtu.be" ||
+    h === "youtube.com" ||
+    h === "music.youtube.com" ||
+    h === "m.youtube.com" ||
+    h === "youtube-nocookie.com" ||
+    h.endsWith(".youtube.com") ||
+    h.endsWith(".youtube-nocookie.com")
+  );
+}
+
+function coercePlayUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^(https?:|ytdl:)/i.test(s)) return s;
+  if (s.startsWith("//") && isYtHost(ytHostOf(s.slice(2)))) return `https:${s}`;
+  if (isYtHost(ytHostOf(s))) return `https://${s.replace(/^\/+/, "")}`;
+  return "";
+}
+
+function youtubeHasTarget(url) {
+  try {
+    const u = new URL(url);
+    const v = u.searchParams.get("v") || "";
+    if (/^[A-Za-z0-9_-]{11}$/.test(v)) return true;
+    if ((u.searchParams.get("list") || "").trim()) return true;
+    if (/^\/(?:shorts|embed|live)\/[A-Za-z0-9_-]{11}/.test(u.pathname)) return true;
+    const host = (u.hostname || "").replace(/^www\./, "");
+    if (host === "youtu.be" && /^\/[A-Za-z0-9_-]{11}/.test(u.pathname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function playUrlError(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return STRINGS.pasteUrlFirst;
+  const coerced = coercePlayUrl(s);
+  if (!coerced) return STRINGS.badUrl;
+  try {
+    const host = new URL(coerced).hostname || "";
+    if (isYtHost(host) && !youtubeHasTarget(coerced)) return STRINGS.badYoutube;
+  } catch {
+    return STRINGS.badUrl;
+  }
+  return null;
+}
+
+function isSpeakerDevice(d) {
+  if (!d) return false;
+  if (d.is_audio) return true;
+  if (String(d.icon || "").toLowerCase().includes("audio")) return true;
+  // light-status placeholder from the server has no MAC
+  if (d.connected && !d.address) return true;
+  return false;
 }
 
 async function api(path, opts = {}) {
@@ -280,12 +365,17 @@ async function api(path, opts = {}) {
     });
   } catch (e) {
     clearTimeout(timer);
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      setOffline(true);
+      return { ok: false, error: STRINGS.offline, _offline: true };
+    }
     if (e && e.name === "AbortError") {
       return { ok: false, error: STRINGS.requestTimeout, _timeout: true };
     }
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
   clearTimeout(timer);
+  setOffline(false);
 
   let data = null;
   try {
@@ -293,7 +383,11 @@ async function api(path, opts = {}) {
   } catch {
     data = { ok: false, error: `HTTP ${res.status}` };
   }
-  if (!res.ok && data && !data.error) data.error = `HTTP ${res.status}`;
+  if (!data || typeof data !== "object") data = { ok: false };
+  if (!res.ok) {
+    data.ok = false;
+    if (!data.error) data.error = `HTTP ${res.status}`;
+  }
   data._httpStatus = res.status;
 
   if (res.status === 401 && data?.auth_required && !authPrompted) {
@@ -428,10 +522,14 @@ function setPlayPauseIcon(playing) {
 
 function updatePlaybackEnabled() {
   const canPlay = hasSpeaker;
-  els.playBtn.disabled = !canPlay;
-  els.searchBtn.disabled = false; // browsing/search OK; play gated in playUrl
+  const hasUrlText = !!(els.ytUrl && els.ytUrl.value.trim());
+  const hasQuery = !!(els.ytSearch && els.ytSearch.value.trim());
+  els.playBtn.disabled = !canPlay || !hasUrlText || actionBusy;
+  if (els.queueUrlBtn) els.queueUrlBtn.disabled = !canPlay || !hasUrlText || actionBusy;
+  if (els.saveUrlBtn) els.saveUrlBtn.disabled = !hasUrlText || actionBusy;
+  els.searchBtn.disabled = !hasQuery || actionBusy;
   els.noSpeakerMsg.hidden = canPlay;
-  els.playPauseBtn.disabled = !canPlay && !playerPlaying && !playerPaused;
+  els.playPauseBtn.disabled = (!canPlay && !playerPlaying && !playerPaused) || actionBusy;
 }
 
 function updateSeekUI(timePos, duration, percent) {
@@ -545,18 +643,20 @@ function renderConnected(devices) {
       </div>
       <div class="cell-actions-inline"></div>`;
     const actions = cell.querySelector(".cell-actions-inline");
-    const disc = document.createElement("button");
-    disc.type = "button";
-    disc.className = "text-btn";
-    disc.textContent = STRINGS.disconnect;
-    disc.addEventListener("click", () => disconnectDevice(d.address));
-    const forget = document.createElement("button");
-    forget.type = "button";
-    forget.className = "text-btn danger-text";
-    forget.textContent = STRINGS.forget;
-    forget.addEventListener("click", () => removeDevice(d.address, d.name));
-    actions.appendChild(disc);
-    actions.appendChild(forget);
+    if (d.address) {
+      const disc = document.createElement("button");
+      disc.type = "button";
+      disc.className = "text-btn";
+      disc.textContent = STRINGS.disconnect;
+      disc.addEventListener("click", () => disconnectDevice(d.address));
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.className = "text-btn danger-text";
+      forget.textContent = STRINGS.forget;
+      forget.addEventListener("click", () => removeDevice(d.address, d.name));
+      actions.appendChild(disc);
+      actions.appendChild(forget);
+    }
     group.appendChild(cell);
   }
 }
@@ -626,7 +726,9 @@ function applyBluetooth(b) {
 
   const connected = Array.isArray(b.connected) ? b.connected : [];
   const devices = Array.isArray(b.devices) ? b.devices : [];
-  hasSpeaker = connected.length > 0 || devices.some((d) => d.connected);
+  hasSpeaker =
+    connected.some((d) => d.connected !== false && isSpeakerDevice(d)) ||
+    devices.some((d) => d.connected && isSpeakerDevice(d));
 
   if (b.powered === false) {
     els.btSubtitle.textContent = STRINGS.btOff;
@@ -645,7 +747,7 @@ function applyBluetooth(b) {
   if (realDevices.length) {
     renderConnected(realDevices);
     renderDevices(realDevices);
-  } else if (connected.some((d) => d.address)) {
+  } else if (connected.length) {
     renderConnected(connected);
   }
 }
@@ -928,10 +1030,15 @@ async function refreshStatus(full = false) {
       setStatus(STRINGS.authRequired);
       return null;
     }
+    if (data?._offline) {
+      setStatus(STRINGS.offline);
+      return null;
+    }
     applyStatus(data);
     return data;
   } catch (e) {
     setStatus(STRINGS.cannotReach);
+    setOffline(true);
     return null;
   }
 }
@@ -942,7 +1049,7 @@ async function refreshDevices() {
     if (data.ok) {
       renderConnected(data.devices);
       renderDevices(data.devices);
-      hasSpeaker = (data.devices || []).some((d) => d.connected);
+      hasSpeaker = (data.devices || []).some((d) => d.connected && isSpeakerDevice(d));
       updatePlaybackEnabled();
     }
   } catch {
@@ -993,7 +1100,7 @@ async function scan() {
     if (data.devices) {
       renderConnected(data.devices);
       renderDevices(data.devices);
-      hasSpeaker = (data.devices || []).some((d) => d.connected);
+      hasSpeaker = (data.devices || []).some((d) => d.connected && isSpeakerDevice(d));
       updatePlaybackEnabled();
       const n = data.count || data.devices.length;
       setStatus(STRINGS.foundDevices(n));
@@ -1101,15 +1208,19 @@ function looksLikeNoSpeakerError(err) {
 }
 
 async function playUrl(url, title) {
-  if (!url) {
-    toast(STRINGS.pasteUrlFirst);
+  const urlErr = playUrlError(url);
+  if (urlErr) {
+    toast(urlErr);
     return;
   }
+  url = coercePlayUrl(url) || url;
   if (!hasSpeaker) {
     toast(STRINGS.noBtSpeaker);
     return;
   }
   localStorage.setItem(LS_URL, url);
+  actionBusy = true;
+  updatePlaybackEnabled();
   setBusy(true, STRINGS.startingStream);
   setStatus(STRINGS.startingPlayback);
   try {
@@ -1126,9 +1237,6 @@ async function playUrl(url, title) {
       els.nowTitle.textContent = data.title || STRINGS.playing;
       els.nowSub.textContent = url;
       els.nowSub.hidden = true;
-      if (!data.sink) {
-        toast(STRINGS.noBtSpeaker);
-      }
     } else {
       const err = data.error || STRINGS.playFailed;
       if (looksLikeNoSpeakerError(err)) {
@@ -1145,7 +1253,9 @@ async function playUrl(url, title) {
   } catch {
     toast(STRINGS.playFailed);
   } finally {
+    actionBusy = false;
     setBusy(false);
+    updatePlaybackEnabled();
   }
 }
 
@@ -1401,10 +1511,12 @@ function titleForQueueUrl(url, title) {
 }
 
 async function enqueueUrl(url, title, expand) {
-  if (!url) {
-    toast(STRINGS.pasteUrlFirst);
+  const urlErr = playUrlError(url);
+  if (urlErr) {
+    toast(urlErr);
     return;
   }
+  url = coercePlayUrl(url) || url;
   if (!hasSpeaker) {
     toast(STRINGS.noBtSpeaker);
     return;
@@ -1454,6 +1566,10 @@ async function searchYoutube() {
     toast(STRINGS.enterSearch);
     return;
   }
+  actionBusy = true;
+  updatePlaybackEnabled();
+  els.searchResults.hidden = false;
+  els.searchResults.innerHTML = `<div class="cell empty"><div class="cell-body"><div class="cell-title muted">${STRINGS.searchingResults}</div></div></div>`;
   setBusy(true, STRINGS.searching);
   try {
     const data = await api("/api/search", {
@@ -1462,6 +1578,7 @@ async function searchYoutube() {
     });
     if (!data.ok) {
       toast(data.error || STRINGS.searchFailed);
+      els.searchResults.innerHTML = `<div class="cell empty"><div class="cell-body"><div class="cell-title muted">${escapeHtml(data.error || STRINGS.searchFailed)}</div></div></div>`;
       return;
     }
     const results = data.results || data.items || data.videos || [];
@@ -1469,7 +1586,9 @@ async function searchYoutube() {
   } catch {
     toast(STRINGS.searchFailed);
   } finally {
+    actionBusy = false;
     setBusy(false);
+    updatePlaybackEnabled();
   }
 }
 
@@ -1679,11 +1798,12 @@ function scheduleSavePoll() {
 }
 
 async function saveUrl(url) {
-  const href = (url || "").trim();
-  if (!href) {
-    toast(STRINGS.pasteUrlToSave);
+  const urlErr = playUrlError(url);
+  if (urlErr) {
+    toast(urlErr === STRINGS.pasteUrlFirst ? STRINGS.pasteUrlToSave : urlErr);
     return;
   }
+  const href = coercePlayUrl(url) || String(url || "").trim();
   const data = await api("/api/library/save-url", {
     method: "POST",
     body: JSON.stringify({ url: href }),
@@ -2013,7 +2133,7 @@ async function startRecording() {
     stopRecTracks();
     els.recBtn.classList.remove("is-recording");
     els.recActions.hidden = false;
-    els.recHint.textContent = STRINGS.recHintRecording;
+    els.recHint.textContent = STRINGS.recHintReady;
   };
   recRecorder.start(250);
   els.recBtn.classList.add("is-recording");
@@ -2128,13 +2248,24 @@ function bind() {
   els.ytUrl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") play();
   });
+  els.ytUrl.addEventListener("input", updatePlaybackEnabled);
   els.ytUrl.addEventListener("change", () => {
     const v = els.ytUrl.value.trim();
     if (v) localStorage.setItem(LS_URL, v);
+    updatePlaybackEnabled();
   });
   els.searchBtn.addEventListener("click", searchYoutube);
   els.ytSearch.addEventListener("keydown", (e) => {
     if (e.key === "Enter") searchYoutube();
+  });
+  els.ytSearch.addEventListener("input", updatePlaybackEnabled);
+  window.addEventListener("online", () => {
+    setOffline(false);
+    refreshStatus();
+  });
+  window.addEventListener("offline", () => {
+    setOffline(true);
+    toast(STRINGS.offline);
   });
   els.saveUrlBtn.addEventListener("click", saveCurrentUrl);
   els.sourceTabs.addEventListener("click", (e) => {
@@ -2207,6 +2338,7 @@ async function init() {
   setPlayPauseIcon(false);
   updatePlaybackEnabled();
   updateRecSecureNote();
+  if (typeof navigator !== "undefined" && navigator.onLine === false) setOffline(true);
   await refreshStatus();
   schedulePoll();
 }

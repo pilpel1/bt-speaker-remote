@@ -98,8 +98,13 @@ body {
 }
 
 .cell-actions-inline .text-btn {
-  padding: 0;
+  padding: 8px 10px;
+  min-height: 44px;
+  min-width: 44px;
   font-size: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .cell-forget {
@@ -382,6 +387,7 @@ body {
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-height: 44px;
   padding: 10px 8px;
   border: 0;
   background: transparent;
@@ -631,8 +637,8 @@ body {
 }
 
 .icon-mini {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border: 0;
   background: transparent;
   color: var(--blue);
@@ -711,6 +717,7 @@ body {
   border: 0;
   border-radius: 20px;
   padding: 8px 14px;
+  min-height: 40px;
   font-size: 15px;
   font-weight: 600;
   background: var(--fill);
@@ -746,7 +753,8 @@ body {
   font: inherit;
   font-size: 13px;
   font-weight: 600;
-  padding: 8px 4px;
+  padding: 10px 4px;
+  min-height: 44px;
   border-radius: 8px;
   cursor: pointer;
 }
@@ -946,6 +954,21 @@ body {
 
 .device-btn:active { opacity: 0.6; }
 
+.offline-banner {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 149, 0, 0.16);
+  color: var(--orange);
+  font-size: 14px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.offline-banner[hidden] {
+  display: none !important;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -1036,4 +1059,5 @@ body {
   .ios-switch .track { background: #39393d; }
   .busy { background: rgba(0,0,0,0.55); }
   .no-speaker-msg { background: rgba(255, 59, 48, 0.18); }
+  .offline-banner { background: rgba(255, 149, 0, 0.22); }
 }
